@@ -248,8 +248,9 @@ def run(
                             xyImageLoc = np.array([[xywh[0],xywh[0]-xywh[2]/2,xywh[0]+xywh[2]/2],
                                                   [xywh[1]+xywh[3]/2,xywh[1]+xywh[3]/2,xywh[1]+xywh[3]/2]])
                             xyVehicleLoc = compute_uv2xy_projection(xyImageLoc, I2V_Mat_T)
+                            #print(xyVehicleLoc)
                             xyBevLoc = compute_uv2xy_projection(xyImageLoc, I2B_Mat_T)
-                            objVehicleLoc = '(%.1fm,%.1fm)' % (xyVehicleLoc[0,0], xyVehicleLoc[0,0])
+                            objVehicleLoc = '(%.1fm,%.1fm)' % (xyVehicleLoc[0,0], xyVehicleLoc[1,0])
                             annotator.box_location(xyxy, objVehicleLoc, color=colors(c, True))
                             #annotator.kpts(xyImageLoc.T)
                             Bird_annotator.kpts(xyBevLoc.T,BevSize,radius=3)
