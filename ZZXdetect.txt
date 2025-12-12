@@ -274,8 +274,6 @@ def run(
                 #V = cv2.normalize(V, None, 100, 255, cv2.NORM_MINMAX, cv2.CV_8U) / 255.0
                 BirdImage_V = create_birdimage(V, srcXIntrinsic, srcYIntrinsic)
                 BirdImage_VMat = np2cv(BirdImage_V)
-                #BirdImage_VMat = np.ones((BirdImage_VMat.shape[0], BirdImage_VMat.shape[1]), dtype=np.uint8) * 255
-                BirdImage_VMat = np.ones((BirdImage_VMat.shape[0], BirdImage_VMat.shape[1], 1), dtype=np.uint8) * 255
                 Bird_annotator = Annotator(BirdImage_VMat, line_width=line_thickness, example=str(names))
 
             if len(det):
@@ -382,14 +380,10 @@ def run(
                     iterations = 3  # 膨胀迭代次数（可调整）
                     kernel = np.ones((kernel_size, kernel_size), np.uint8)
                     dilated_mask = cv2.dilate(mask_inv, kernel, iterations=iterations)
+                    #dilated_mask=dilated_mask-obstacle_mask
 
                     # Step 3: Canny边缘检测
                     edges = cv2.Canny(dilated_mask, threshold1=0, threshold2=100, apertureSize=3)
-
-                    # ---------------------- 关键修改：对边缘图像做形态学闭合（修复断开的边缘，解决轮廓不封闭的源头） ----------------------
-                    # 这一步是图像操作，不会报错，还能闭合Canny检测出的断开边缘
-                    close_kernel = np.ones((3, 3), np.uint8)
-                    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel, iterations=1)
 
                     # Step 4: 查找轮廓（仅外部轮廓）
                     contours, _ = cv2.findContours(
@@ -397,12 +391,12 @@ def run(
                         mode=cv2.RETR_EXTERNAL,
                         method=cv2.CHAIN_APPROX_SIMPLE
                     )
-                    #print(contours)
-                    # Step 5: 在原图上绘制绿色轮廓（厚度=5像素）
+
+                    # Step 5: 在原图上绘制蓝色轮廓（厚度=5像素）
                     cv2.drawContours(
                         image=im0,
                         contours=contours,
-                        contourIdx=0,  # 绘制所有轮廓
+                        contourIdx=-1,  # 绘制所有轮廓
                         color=(0, 255, 0),  # BGR绿色 (0,255,0)
                         thickness=1,
                         lineType=cv2.LINE_AA
@@ -411,68 +405,8 @@ def run(
                 #cv2.imshow('im0', im0)
                 #cv2.imshow('imc', imc)
                 cv2.waitKey(1)  # 1 millisecond
-                # 2. 处理轮廓并转换为投影后的轮廓（contoursBevLoc）
-                contoursBevLoc = []  # 存储每个轮廓投影后的结果
-
-                for cnt in contours:
-                    if len(cnt) == 0:
-                        continue  # 跳过空轮廓
-
-                    # 步骤1：将单个轮廓从 (N, 1, 2) 重塑为 (2, N)
-                    cnt_points = cnt.reshape(-1, 2).T  # 结果：(2, N)，对应u/v坐标
-
-                    # 步骤2：调用投影函数
-                    cnt_bev = compute_uv2xy_projection(cnt_points, I2B_Mat_T)  # I2B_Mat_T是你的变换矩阵
-
-                    # 步骤3：先处理投影后的点的闭合，再转格式（核心修复：避开直接操作轮廓的形态学错误）
-                    cnt_bev_2d = cnt_bev.T  # 转成 (N, 2) 格式（浮点数）
-                    # 强制闭合：用np.allclose兼容浮点数微小误差，解决首末点不重合问题
-                    if cnt_bev_2d.shape[0] > 0 and not np.allclose(cnt_bev_2d[0], cnt_bev_2d[-1]):
-                        cnt_bev_2d = np.vstack([cnt_bev_2d, cnt_bev_2d[0]])  # 拼接首点，强制闭合
-                    # 转成OpenCV要求的 (N, 1, 2) 格式 + int32类型（必须转int32，否则OpenCV绘制会报错）
-                    cnt_bev_reshaped = cnt_bev_2d.reshape(-1, 1, 2).astype(np.int32)
-
-                    # 步骤4：添加到结果列表
-                    contoursBevLoc.append(cnt_bev_reshaped)
-
-
-
-                Bird_annotator.draw_contours(
-                    contours=contoursBevLoc,
-                    color=0,  # BGR黑色
-                    thickness=1,
-                    #fill_color=(0, 255, 0)  # 填充色（BGR绿色）
-                )
-                # 假设BirdImage_VMat是灰度图像数组
-                thresh = 64
-                maxval = 255
-                # 最常用的二值化类型：cv2.THRESH_BINARY，去掉目标，只剩道路
-                #ret, BirdEdge_VMat = cv2.threshold(BirdImage_VMat, thresh, maxval, cv2.THRESH_BINARY)
-
-                # # # 假设BirdEdge_VMat是单通道二值图像（0=黑，255=白）
-                # # # 步骤1：查找轮廓（保留你的原逻辑）
-                # BirdEdgecontours, _ = cv2.findContours(
-                #     BirdEdge_VMat,
-                #     mode=cv2.RETR_TREE,  # 改为提取所有轮廓
-                #     method=cv2.CHAIN_APPROX_SIMPLE
-                # )
-                # print(BirdEdgecontours)
-                # #
-                # # 步骤2：绘制填充轮廓（关键修改：color改为255白色，而非0黑色）
-                # # 注意：单通道图像的color只能是单值（如255），彩色图像才是三元组（如(0,255,0)）
-                # cv2.drawContours(
-                #     image=BirdEdge_VMat,
-                #     contours=BirdEdgecontours,
-                #     contourIdx=0,  # 绘制所有轮廓
-                #     color=0 , # 单通道：白色（替换原来的0）；若为彩色图则用(0,255,0)
-                #     thickness=-1,  # 填充轮廓
-                #     lineType=cv2.LINE_AA
-                # )
-                #Bird_annotator.fill_drivable_black_horizontal()
-                # print(contoursBevLoc)
             if view_bev:
                 BirdImage_VMat =Bird_annotator.result()
-
 
                 #ret, BirdImage_VMat = cv2.threshold(BirdImage_VMat, 0, 255, cv2.THRESH_BINARY)
                 cv2.imshow('bev', BirdImage_VMat)
