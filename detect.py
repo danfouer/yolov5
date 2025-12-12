@@ -27,7 +27,9 @@ Usage - formats:
                                  yolov5s_edgetpu.tflite     # TensorFlow Edge TPU
                                  yolov5s_paddle_model       # PaddlePaddle
 """
-
+import tempfile
+import glob
+import shutil
 import argparse
 import csv
 import os
@@ -62,7 +64,7 @@ def run(
         iou_thres=0.45,  # NMS IOU threshold
         max_det=1000,  # maximum detections per image
         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
-        view_img=False,  # show results
+        view_img=True,  # show results
         save_txt=False,  # save results to *.txt
         save_csv=False,  # save results in CSV format
         save_conf=False,  # save confidences in --save-txt labels
@@ -91,6 +93,33 @@ def run(
     screenshot = source.lower().startswith('screen')
     if is_url and is_file:
         source = check_file(source)  # download
+        # ================ 新增代码开始 ================ #
+        # 如果源是目录，递归查找所有图像文件
+    if os.path.isdir(source):
+        LOGGER.info(f"递归查找目录中的图像: {source}")
+
+        # 递归查找所有图片文件
+        img_files = []
+        valid_suffixes = [ext.lower() for ext in IMG_FORMATS]
+
+        for root, _, files in os.walk(source):
+            for file in files:
+                if Path(file).suffix[1:].lower() in valid_suffixes:
+                    img_files.append(os.path.join(root, file))
+
+        if not img_files:
+            LOGGER.warning(f"目录中没有找到图像文件: {source}")
+            return
+
+        # 创建临时文件保存路径列表
+        temp_list = tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False)
+        with open(temp_list.name, 'w') as f:
+            f.write('\n'.join(img_files))
+
+        LOGGER.info(f"创建包含 {len(img_files)} 个图像的临时列表: {temp_list.name}")
+        source = temp_list.name
+        is_file = True  # 现在源是文件列表
+    # ================ 新增代码结束 ================ #
 
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run

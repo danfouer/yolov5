@@ -28,6 +28,9 @@ Usage - formats:
                                  yolov5s_paddle_model       # PaddlePaddle
 """
 
+import tempfile
+import glob
+import shutil
 import argparse
 import csv
 import os
@@ -60,6 +63,7 @@ from utils.utilsbev import *
 @smart_inference_mode()
 def run(
         weights=ROOT / 'yolov5s.pt',  # model path or triton URL
+        jsonfile=ROOT / 'Trans_Mat_05_highway_lanechange_25s.json',  # json file path
         source=ROOT / 'data/images',  # file/dir/URL/glob/screen/0(webcam)
         data=ROOT / 'data/coco128.yaml',  # dataset.yaml path
         imgsz=(640, 640),  # inference size (height, width)
@@ -67,7 +71,7 @@ def run(
         iou_thres=0.45,  # NMS IOU threshold
         max_det=1000,  # maximum detections per image
         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
-        view_img=False,  # show results
+        view_img=True,  # show results
         view_bev=False,  # show brid of view results
         view_loc=False,  # show location results
         save_txt=False,  # save results to *.txt
@@ -98,6 +102,37 @@ def run(
     screenshot = source.lower().startswith('screen')
     if is_url and is_file:
         source = check_file(source)  # download
+        print(source)
+
+    # ================ 新增代码开始 ================ #
+    # 如果源是目录，递归查找所有图像文件
+    if os.path.isdir(source):
+        LOGGER.info(f"递归查找目录中的图像: {source}")
+
+        # 递归查找所有图片文件
+        img_files = []
+        valid_suffixes = [ext.lower() for ext in IMG_FORMATS]
+
+        for root, _, files in os.walk(source):
+            for file in files:
+                if Path(file).suffix[1:].lower() in valid_suffixes:
+                    img_files.append(os.path.join(root, file))
+
+        if not img_files:
+            LOGGER.warning(f"目录中没有找到图像文件: {source}")
+            return
+
+        # 创建临时文件保存路径列表
+        temp_list = tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False)
+        with open(temp_list.name, 'w') as f:
+            f.write('\n'.join(img_files))
+
+        LOGGER.info(f"创建包含 {len(img_files)} 个图像的临时列表: {temp_list.name}")
+        source = temp_list.name
+        print(source)
+        is_file = False  # 现在源是文件列表
+    # ================ 新增代码结束 ================ #
+
 
     # Directories
     save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
@@ -123,8 +158,40 @@ def run(
     vid_path, vid_writer = [None] * bs, [None] * bs
  #############################################################################
     if view_bev:
-        with open(source+'.json', 'r') as f:
-            Trans_Mat = json.load(f)
+        if is_file:
+            with open(source+'.json', 'r') as f:
+                Trans_Mat = json.load(f)
+        else:
+            #jsonfile = str(jsonfile)
+            #json_path = Path(jsonfile)
+            if isinstance(jsonfile, list) and jsonfile:
+                jsonfile = jsonfile[0]  # 取列表中的第一个元素
+            jsonfile = str(jsonfile)  # 确保是字符串类型
+            print(jsonfile)
+            with open(jsonfile, 'r') as f:
+                Trans_Mat = json.load(f)
+    # if view_bev:
+    #     json_path = None
+    #
+    #     # 如果是单个文件，尝试使用与图像同名的JSON文件
+    #     if is_file:
+    #         json_path = Path(source).with_suffix('.json')
+    #         if not json_path.exists():
+    #             LOGGER.warning(f"Image-specific JSON not found: {json_path}")
+    #             json_path = None
+    #
+    #     # 如果未找到图像特定JSON，使用指定的jsonfile
+    #     if not json_path:
+    #         json_path = Path(jsonfile)
+    #         LOGGER.info(f"Using specified JSON file: {json_path}")
+    #
+    #     # 检查并加载JSON文件
+    #     if json_path.exists():
+    #         with open(json_path, 'r') as f:
+    #             Trans_Mat = json.load(f)
+    #     else:
+    #         LOGGER.error(f"JSON file not found: {json_path}")
+    #         continue
         # 读取前视图I-车辆坐标系V-鸟瞰图相互转换矩阵
         # V2I_Mat = np.array(Trans_Mat['V2I_Mat'])
         # I2V_Mat = np.array(Trans_Mat['I2V_Mat'])
@@ -195,7 +262,11 @@ def run(
             s += '%gx%g ' % im.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             #imc = im0.copy() if save_crop else im0  # for save_crop
+            mask = np.ones((im0.shape[0], im0.shape[1]), dtype=np.uint8) * 255
+            obstacle_mask = np.zeros((im0.shape[0], im0.shape[1]), dtype=np.uint8)  # 障碍物掩码
+            has_class10 = False  # 标记是否存在关键目标
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            #maskannotator = Annotator(mask, line_width=line_thickness, example=str(names))
             if view_bev:
                 IhsvMat = cv2.cvtColor(imc, cv2.COLOR_BGR2HSV)
                 Ihsv = IhsvMat[:, :, ::-1]  # transform image to hsv
@@ -252,21 +323,85 @@ def run(
                             xyBevLoc = compute_uv2xy_projection(xyImageLoc, I2B_Mat_T)
                             objVehicleLoc = '(%.1fm,%.1fm)' % (xyVehicleLoc[0,0], xyVehicleLoc[1,0])
                             annotator.box_location(xyxy, objVehicleLoc, color=colors(c, True))
+                            # 获取矩形坐标（整数类型）
+                            x1, y1, x2, y2 = map(int, xyxy)
+                            cv2.rectangle(obstacle_mask, (x1, y1), (x2, y2), 255, -1)
                             #annotator.kpts(xyImageLoc.T)
                             Bird_annotator.kpts(xyBevLoc.T,BevSize,radius=3)
                         elif c in [10]:
-                            label = None if hide_labels else (f'{c:d}' if hide_conf else f'{c:d} {conf:.2f}')
-                            annotator.box_label(xyxy, label, color=colors(c, True))
+                            # label = None if hide_labels else (f'{c:d}' if hide_conf else f'{c:d} {conf:.2f}')
+                            # # #annotator.box_label(xyxy, label, color=colors(c, True))
+                            # maskannotator.box_fill(xyxy, label, color=colors(0, True))
+                            # x1, y1, x2, y2 = map(int, xyxy)
+                            # points = np.array([[x1, y1], [x1, y2], [x2, y2], [x2, y1]], dtype=np.int32)
+                            #
+                            # # 如果是第一个类别10的点，初始化列表；否则追加
+                            # if 'class10_points' not in locals():
+                            #     class10_points = []
+                            # class10_points.append(points)
+                            has_class10 = True
+                            # 获取矩形坐标（整数类型）
+                            x1, y1, x2, y2 = map(int, xyxy)
+                            # 在掩码上绘制实心黑色矩形（填充色=0）
+                            cv2.rectangle(mask, (x1, y1), (x2, y2), color=0, thickness=-1)
+
+
 
 
             # Stream results
             im0 = annotator.result()
-            if view_img or view_loc:
+            if view_img:
                 if platform.system() == 'Linux' and p not in windows:
                     windows.append(p)
                     cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
                     cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
-                cv2.imshow(str(p), im0)
+                cv2.imshow('img', im0)
+                #cv2.imshow('im0', im0)
+                #cv2.imshow('imc', imc)
+                cv2.waitKey(1)  # 1 millisecond
+            if view_loc:
+                if platform.system() == 'Linux' and p not in windows:
+                    windows.append(p)
+                    cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
+                    cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
+                if view_loc and has_class10:
+                    # Step 1: 反转掩码 - 矩形区域变白(255)，背景变黑(0)
+                    mask_inv = 255 - mask
+                    # Step 1.5: 对障碍物掩码进行膨胀处理（关键修改）
+                    # Step 2: 形态学膨胀（合并相邻矩形）
+                    kernel_size = 5  # 核大小（可调整）
+                    iterations = 5  # 膨胀迭代次数（可调整）
+                    obstacle_dilate_kernel = np.ones((kernel_size, kernel_size), np.uint8)  # 使用5x5的膨胀核
+                    dilated_obstacle_mask = cv2.dilate(obstacle_mask, obstacle_dilate_kernel, iterations=iterations)
+                    mask_inv[dilated_obstacle_mask > 0] = 0
+
+                    # Step 2: 形态学膨胀（合并相邻矩形）
+                    kernel_size = 3  # 核大小（可调整）
+                    iterations = 3  # 膨胀迭代次数（可调整）
+                    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+                    dilated_mask = cv2.dilate(mask_inv, kernel, iterations=iterations)
+                    #dilated_mask=dilated_mask-obstacle_mask
+
+                    # Step 3: Canny边缘检测
+                    edges = cv2.Canny(dilated_mask, threshold1=0, threshold2=100, apertureSize=3)
+
+                    # Step 4: 查找轮廓（仅外部轮廓）
+                    contours, _ = cv2.findContours(
+                        edges,
+                        mode=cv2.RETR_EXTERNAL,
+                        method=cv2.CHAIN_APPROX_SIMPLE
+                    )
+
+                    # Step 5: 在原图上绘制蓝色轮廓（厚度=5像素）
+                    cv2.drawContours(
+                        image=im0,
+                        contours=contours,
+                        contourIdx=-1,  # 绘制所有轮廓
+                        color=(0, 255, 0),  # BGR绿色 (0,255,0)
+                        thickness=1,
+                        lineType=cv2.LINE_AA
+                    )
+                cv2.imshow('loc', im0)
                 #cv2.imshow('im0', im0)
                 #cv2.imshow('imc', imc)
                 cv2.waitKey(1)  # 1 millisecond
@@ -312,6 +447,7 @@ def run(
 def parse_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model path or triton URL')
+    parser.add_argument('--jsonfile', nargs='+', type=str, default=ROOT / 'Trans_Mat_05_highway_lanechange_25s.json', help='json file path')
     parser.add_argument('--source', type=str, default=ROOT / 'data/images', help='file/dir/URL/glob/screen/0(webcam)')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='(optional) dataset.yaml path')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
