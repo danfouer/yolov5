@@ -8,6 +8,7 @@ Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, w
 4. BEV二值图像保存到视频所在目录的同名文件夹，命名为视频名_帧数.png
 5. 仅保存BEV二值图片，不保存标记后的视频/图像
 6. 计算并输出原图绿色轮廓和BEV黑色轮廓的安全区域面积
+7. 将每帧面积数据保存到视频所在目录同名文件夹下的视频名.json文件中
 """
 
 import tempfile
@@ -21,8 +22,9 @@ import sys
 from pathlib import Path
 import numpy as np
 import torch
-import json
+import json  # 确保导入json库
 import warnings
+
 warnings.filterwarnings('ignore')
 
 FILE = Path(__file__).resolve()
@@ -40,6 +42,41 @@ from utils.general import (LOGGER, Profile, check_file, check_img_size, check_im
 from utils.torch_utils import select_device, smart_inference_mode
 # 注意：请确保utilsbev.py存在并包含所需函数（如create_birdimage、compute_uv2xy_projection等）
 from utils.utilsbev import *
+
+
+# ====================== 新增：保存面积数据到JSON的函数 ====================== #
+def save_area_data(video_path, data):
+    video_path = Path(video_path)
+    video_dir = video_path.parent  # 视频所在目录
+    video_name = video_path.stem  # 视频文件名（不含扩展名）
+    save_bev_dir = video_dir / video_name  # 视频同名文件夹
+    save_bev_dir.mkdir(parents=True, exist_ok=True)
+
+    # JSON文件路径：视频名.json
+    json_path = save_bev_dir / f"{video_name}.json"
+
+    # 读取已有数据（如果存在）
+    existing_data = {}
+    if json_path.exists():
+        try:
+            with open(json_path, 'r') as f:
+                existing_data = json.load(f)
+        except json.JSONDecodeError:
+            # 如果文件损坏，重新初始化
+            existing_data = {}
+            LOGGER.warning(f"JSON文件{json_path}损坏，将重新创建")
+
+    # 添加当前视频数据（video_1, video_2...）
+    video_key = f"video_{len(existing_data) + 1}"
+    existing_data[video_key] = data
+
+    # 保存更新后的数据
+    with open(json_path, 'w') as f:
+        json.dump(existing_data, f, indent=2)
+    LOGGER.info(f"面积数据已保存到：{json_path}")
+
+
+# ============================================================================== #
 
 @smart_inference_mode()
 def run(
@@ -76,6 +113,11 @@ def run(
         vid_stride=1,  # video frame-rate stride
         scale_ratio=0.5,  # 新增：loc窗口显示的图像缩放比例（默认0.5即50%）
 ):
+    # ====================== 新增：初始化面积数据存储 ====================== #
+    area_data = {}  # 格式: {视频路径: {'video_id': ..., 'loc_area': [], 'bev_area': []}}
+    current_video_path = None  # 跟踪当前处理的视频路径
+    # ============================================================================== #
+
     source = str(source)
     # 原save_img逻辑保留，但后续不再使用它来控制BEV保存，且强制关闭标记后视频保存
     save_img = not nosave and not source.endswith('.txt')  # 仅用于兼容原有txt/csv/crop逻辑
@@ -237,6 +279,9 @@ def run(
             obstacle_mask = np.zeros((im0.shape[0], im0.shape[1]), dtype=np.uint8)  # 障碍物掩码
             has_class10 = False  # 标记是否存在关键目标
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            # 初始化面积变量，防止未定义
+            total_original_area = 0.0
+            total_bev_area = 0.0
             if view_bev:
                 IhsvMat = cv2.cvtColor(imc, cv2.COLOR_BGR2HSV)
                 Ihsv = IhsvMat[:, :, ::-1]  # transform image to hsv
@@ -277,11 +322,12 @@ def run(
                     if view_loc:  # Add bbox to image
                         c = int(cls)
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4))).view(-1).tolist()
-                        if c in [0,1,2,3,4,5,6,7]:
-                            xyImageLoc = np.array([[xywh[0],xywh[0]-xywh[2]/2,xywh[0]+xywh[2]/2],
-                                                  [xywh[1]+xywh[3]/2,xywh[1]+xywh[3]/2,xywh[1]+xywh[3]/2]])
+                        if c in [0, 1, 2, 3, 4, 5, 6, 7]:
+                            xyImageLoc = np.array([[xywh[0], xywh[0] - xywh[2] / 2, xywh[0] + xywh[2] / 2],
+                                                   [xywh[1] + xywh[3] / 2, xywh[1] + xywh[3] / 2,
+                                                    xywh[1] + xywh[3] / 2]])
                             xyVehicleLoc = compute_uv2xy_projection(xyImageLoc, I2V_Mat_T)
-                            objVehicleLoc = '(%.1fm,%.1fm)' % (xyVehicleLoc[0,0], xyVehicleLoc[1,0])
+                            objVehicleLoc = '(%.1fm,%.1fm)' % (xyVehicleLoc[0, 0], xyVehicleLoc[1, 0])
                             annotator.box_location(xyxy, objVehicleLoc, color=colors(c, True))
                             # 获取矩形坐标（整数类型）
                             x1, y1, x2, y2 = map(int, xyxy)
@@ -289,7 +335,7 @@ def run(
                             # ====================== 修复：定义xyBevLoc变量（关键修改） ====================== #
                             xyBevLoc = compute_uv2xy_projection(xyImageLoc, I2B_Mat_T)  # 计算BEV坐标
                             # ============================================================================== #
-                            Bird_annotator.kpts(xyBevLoc.T,BevSize,radius=3)
+                            Bird_annotator.kpts(xyBevLoc.T, BevSize, radius=3)
                         elif c in [10]:
                             has_class10 = True
                             # 获取矩形坐标（整数类型）
@@ -353,7 +399,7 @@ def run(
                         lineType=cv2.LINE_AA
                     )
 
-                    # ====================== 新增：计算并输出原图绿色轮廓（安全区域）的总面积 ====================== #
+                    # ====================== 计算并输出原图绿色轮廓（安全区域）的总面积 ====================== #
                     if contours:
                         # 初始化总面积
                         total_original_area = 0.0
@@ -408,7 +454,7 @@ def run(
                     thickness=1,
                 )
 
-                # ====================== 新增：计算并输出BEV黑色轮廓（安全区域）的总面积 ====================== #
+                # ====================== 计算并输出BEV黑色轮廓（安全区域）的总面积 ====================== #
                 if contoursBevLoc:
                     # 初始化总面积
                     total_bev_area = 0.0
@@ -447,6 +493,30 @@ def run(
                     cv2.imwrite(str(img_save_path), BirdEdge_VMat)
                 cv2.waitKey(1)  # 1 millisecond
 
+            # ====================== 新增：收集视频帧的面积数据到字典 ====================== #
+            if dataset.mode == 'video':
+                # 提取video_id（从视频名“1_002_0_149.mp4”中取“1_002”）
+                video_name = p.stem
+                video_id_parts = video_name.split('_')[:2]  # 取前两部分
+                video_id = '_'.join(video_id_parts)  # 如：1_002
+
+                # 初始化当前视频的数据存储
+                if str(p) not in area_data:
+                    # 如果是新视频，先保存上一个视频的数据（如果存在）
+                    if current_video_path and current_video_path in area_data:
+                        save_area_data(current_video_path, area_data[current_video_path])
+                    area_data[str(p)] = {
+                        'video_id': video_id,
+                        'loc_area': [],
+                        'bev_area': []
+                    }
+                    current_video_path = str(p)
+
+                # 添加当前帧的面积数据（保留2位小数）
+                area_data[str(p)]['loc_area'].append(round(total_original_area, 2))
+                area_data[str(p)]['bev_area'].append(round(total_bev_area, 2))
+            # ============================================================================== #
+
             # ================ 关键修改：强制关闭标记后的视频/图像保存（注释或添加False条件） ================ #
             # 原save_img逻辑被注释，彻底禁用标记后的视频/图像保存
             # if save_img:
@@ -459,7 +529,7 @@ def run(
             #                 vid_writer[i].release()  # release previous video writer
             #             if vid_cap:  # video
             #                 fps = vid_cap.get(cv2.CAP_PROP_FPS)
-            #                 w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            #                 w = int(vid_cap.get(cv2.CAP_PROP_FPS))
             #                 h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             #             else:  # stream
             #                 fps, w, h = 30, im0.shape[1], im0.shape[0]
@@ -470,6 +540,11 @@ def run(
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
 
+    # ====================== 新增：保存最后一个视频的面积数据 ====================== #
+    if dataset.mode == 'video' and current_video_path and current_video_path in area_data:
+        save_area_data(current_video_path, area_data[current_video_path])
+    # ============================================================================== #
+
     # Print results
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
     LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}' % t)
@@ -479,10 +554,12 @@ def run(
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
 
+
 def parse_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model path or triton URL')
-    parser.add_argument('--jsonfile', nargs='+', type=str, default=ROOT / 'Trans_Mat_05_highway_lanechange_25s.json', help='json file path')
+    parser.add_argument('--jsonfile', nargs='+', type=str, default=ROOT / 'Trans_Mat_05_highway_lanechange_25s.json',
+                        help='json file path')
     parser.add_argument('--source', type=str, default=ROOT / 'data/images', help='file/dir/URL/glob/screen/0(webcam)')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='(optional) dataset.yaml path')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
@@ -513,16 +590,18 @@ def parse_opt():
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
     # 新增：scale-ratio参数，用于配置loc窗口的缩放比例
-    parser.add_argument('--scale-ratio', type=float, default=0.5, 
+    parser.add_argument('--scale-ratio', type=float, default=0.5,
                         help='loc窗口显示的图像缩放比例（如0.5表示50%，1.0表示100%）')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
     return opt
 
+
 def main(opt):
     check_requirements(ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
     run(**vars(opt))
+
 
 if __name__ == '__main__':
     opt = parse_opt()
