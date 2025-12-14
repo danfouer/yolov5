@@ -6,6 +6,7 @@ Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, w
 2. 可通过--scale-ratio配置loc窗口的显示缩放比例（默认0.5即50%）
 3. JSON文件加载逻辑：优先源文件同名JSON，不存在则用--jsonfile指定的
 4. BEV二值图像保存到视频所在目录的同名文件夹，命名为视频名_帧数.png
+5. 仅保存BEV二值图片，不保存标记后的视频/图像
 """
 
 import tempfile
@@ -57,7 +58,7 @@ def run(
         save_csv=False,  # save results in CSV format
         save_conf=False,  # save confidences in --save-txt labels
         save_crop=False,  # save cropped prediction boxes
-        nosave=False,  # do not save images/videos
+        nosave=False,  # do not save images/videos（现在仅影响txt/csv/crop，不影响BEV图片）
         classes=None,  # filter by class: --class 0, or --class 0 2 3
         agnostic_nms=False,  # class-agnostic NMS
         augment=False,  # augmented inference
@@ -75,7 +76,8 @@ def run(
         scale_ratio=0.5,  # 新增：loc窗口显示的图像缩放比例（默认0.5即50%）
 ):
     source = str(source)
-    save_img = not nosave and not source.endswith('.txt')  # save inference images
+    # 原save_img逻辑保留，但后续不再使用它来控制BEV保存，且强制关闭标记后视频保存
+    save_img = not nosave and not source.endswith('.txt')  # 仅用于兼容原有txt/csv/crop逻辑
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(('rtsp://', 'rtmp://', 'http://', 'https://'))
     webcam = source.isnumeric() or source.endswith('.streams') or (is_url and not is_file)
@@ -226,7 +228,7 @@ def run(
                 p, im0, imc, frame = path, im0s.copy(), im0s.copy(), getattr(dataset, 'frame', 0)
 
             p = Path(p)  # to Path
-            save_path = str(save_dir / p.name)  # im.jpg
+            save_path = str(save_dir / p.name)  # im.jpg（后续不再使用）
             txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
             s += '%gx%g ' % im.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
@@ -344,7 +346,7 @@ def run(
                     cv2.drawContours(
                         image=im0,
                         contours=contours,
-                        contourIdx=0,  # 绘制所有轮廓
+                        contourIdx=-1,  # 修复：绘制所有轮廓（原0只绘制第一个，改为-1）
                         color=(0, 255, 0),  # BGR绿色
                         thickness=1,
                         lineType=cv2.LINE_AA
@@ -395,12 +397,12 @@ def run(
                 maxval = 255
                 ret, BirdEdge_VMat = cv2.threshold(BirdImage_VMat, thresh, maxval, cv2.THRESH_BINARY)
 
-            # ================ 新增：保存BEV二值图像 ================ #
+            # ================ 新增：保存BEV二值图像（修改：移除save_img依赖，只保留视频模式判断） ================ #
             if view_bev:
                 BirdImage_VMat = Bird_annotator.result()
                 cv2.imshow('bev', BirdImage_VMat)
-                # 保存二值图片到视频所在目录的同名文件夹
-                if save_img and dataset.mode == 'video':
+                # 保存二值图片到视频所在目录的同名文件夹（仅当处理视频时保存，不再依赖save_img）
+                if dataset.mode == 'video':  # 关键修改：移除save_img，只判断是否是视频模式
                     video_path = Path(p)
                     video_dir = video_path.parent  # 视频所在目录
                     video_name = video_path.stem  # 视频文件名（不含扩展名）
@@ -411,27 +413,28 @@ def run(
                     img_filename = f"{video_name}_{frame}.png"
                     img_save_path = save_bev_dir / img_filename
                     # 保存二值图片
-                    cv2.imwrite(str(img_save_path), BirdEdge_VMat)
+                    cv2.imwrite(str(img_save_path), BirdImage_VMat)
                 cv2.waitKey(1)  # 1 millisecond
 
-            # Save results (image with detections)
-            if save_img:
-                if dataset.mode == 'image':
-                    cv2.imwrite(save_path, im0)
-                else:  # 'video' or 'stream'
-                    if vid_path[i] != save_path:  # new video
-                        vid_path[i] = save_path
-                        if isinstance(vid_writer[i], cv2.VideoWriter):
-                            vid_writer[i].release()  # release previous video writer
-                        if vid_cap:  # video
-                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                            w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        else:  # stream
-                            fps, w, h = 30, im0.shape[1], im0.shape[0]
-                        save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix
-                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                    vid_writer[i].write(im0)
+            # ================ 关键修改：强制关闭标记后的视频/图像保存（注释或添加False条件） ================ #
+            # 原save_img逻辑被注释，彻底禁用标记后的视频/图像保存
+            # if save_img:
+            #     if dataset.mode == 'image':
+            #         cv2.imwrite(save_path, im0)
+            #     else:  # 'video' or 'stream'
+            #         if vid_path[i] != save_path:  # new video
+            #             vid_path[i] = save_path
+            #             if isinstance(vid_writer[i], cv2.VideoWriter):
+            #                 vid_writer[i].release()  # release previous video writer
+            #             if vid_cap:  # video
+            #                 fps = vid_cap.get(cv2.CAP_PROP_FPS)
+            #                 w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            #                 h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            #             else:  # stream
+            #                 fps, w, h = 30, im0.shape[1], im0.shape[0]
+            #             save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix
+            #             vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+            #         vid_writer[i].write(im0)
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
@@ -463,7 +466,7 @@ def parse_opt():
     parser.add_argument('--save-csv', action='store_true', help='save results in CSV format')
     parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
     parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
-    parser.add_argument('--nosave', action='store_true', help='do not save images/videos')
+    parser.add_argument('--nosave', action='store_true', help='do not save images/videos（不影响BEV图片）')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
