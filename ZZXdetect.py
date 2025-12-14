@@ -7,6 +7,7 @@ Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, w
 3. JSON文件加载逻辑：优先源文件同名JSON，不存在则用--jsonfile指定的
 4. BEV二值图像保存到视频所在目录的同名文件夹，命名为视频名_帧数.png
 5. 仅保存BEV二值图片，不保存标记后的视频/图像
+6. 计算并输出原图绿色轮廓和BEV黑色轮廓的安全区域面积
 """
 
 import tempfile
@@ -352,6 +353,21 @@ def run(
                         lineType=cv2.LINE_AA
                     )
 
+                    # ====================== 新增：计算并输出原图绿色轮廓（安全区域）的总面积 ====================== #
+                    if contours:
+                        # 初始化总面积
+                        total_original_area = 0.0
+                        for cnt in contours:
+                            # 计算单个轮廓的面积并累加（cv2.contourArea返回浮点数）
+                            cnt_area = cv2.contourArea(cnt)
+                            if cnt_area > 0:  # 过滤无效的轮廓面积
+                                total_original_area += cnt_area
+                        # 输出面积（保留2位小数，单位：像素²）
+                        LOGGER.info(f"【{p.name}_帧{frame}】原图安全区域（绿色轮廓）总面积：{total_original_area:.2f} 像素²")
+                    else:
+                        LOGGER.info(f"【{p.name}_帧{frame}】原图未检测到有效轮廓，安全区域面积为0")
+                    # =========================================================================================== #
+
                 # 核心：根据scale_ratio计算新尺寸并缩放图像
                 h, w = im0.shape[:2]
                 new_w = int(w * scale_ratio)
@@ -392,6 +408,21 @@ def run(
                     thickness=1,
                 )
 
+                # ====================== 新增：计算并输出BEV黑色轮廓（安全区域）的总面积 ====================== #
+                if contoursBevLoc:
+                    # 初始化总面积
+                    total_bev_area = 0.0
+                    for cnt in contoursBevLoc:
+                        # 计算单个轮廓的面积并累加
+                        cnt_area = cv2.contourArea(cnt)
+                        if cnt_area > 0:  # 过滤无效的轮廓面积
+                            total_bev_area += cnt_area
+                    # 输出面积（保留2位小数，单位：像素²；若有实际物理尺度，可在此处添加转换逻辑）
+                    LOGGER.info(f"【{p.name}_帧{frame}】BEV安全区域（黑色轮廓）总面积：{total_bev_area:.2f} 像素²")
+                else:
+                    LOGGER.info(f"【{p.name}_帧{frame}】BEV未检测到有效轮廓，安全区域面积为0")
+                # =========================================================================================== #
+
                 # 二值化处理BEV图像
                 thresh = 64
                 maxval = 255
@@ -400,7 +431,7 @@ def run(
             # ================ 新增：保存BEV二值图像（修改：移除save_img依赖，只保留视频模式判断） ================ #
             if view_bev:
                 BirdImage_VMat = Bird_annotator.result()
-                cv2.imshow('bev', BirdImage_VMat)
+                cv2.imshow('bev', BirdEdge_VMat)
                 # 保存二值图片到视频所在目录的同名文件夹（仅当处理视频时保存，不再依赖save_img）
                 if dataset.mode == 'video':  # 关键修改：移除save_img，只判断是否是视频模式
                     video_path = Path(p)
@@ -413,7 +444,7 @@ def run(
                     img_filename = f"{video_name}_{frame}.png"
                     img_save_path = save_bev_dir / img_filename
                     # 保存二值图片
-                    cv2.imwrite(str(img_save_path), BirdImage_VMat)
+                    cv2.imwrite(str(img_save_path), BirdEdge_VMat)
                 cv2.waitKey(1)  # 1 millisecond
 
             # ================ 关键修改：强制关闭标记后的视频/图像保存（注释或添加False条件） ================ #
