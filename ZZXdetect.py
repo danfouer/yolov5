@@ -7,8 +7,9 @@ Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, w
 3. JSON文件加载逻辑：优先源文件同名JSON，不存在则用--jsonfile指定的
 4. BEV二值图像保存到视频所在目录的同名文件夹，命名为视频名_帧数.png
 5. 仅保存BEV二值图片，不保存标记后的视频/图像
-6. 计算并输出原图绿色轮廓和BEV黑色轮廓的安全区域面积
+6. 计算并输出原图绿色轮廓和BEV黑色轮廓的安全区域面积（优化输出逻辑，确保日志显示）
 7. 将每帧面积数据保存到视频所在目录同名文件夹下的视频名.json文件中
+8. BEV图像可上下翻转（默认开启），使图像最下方延伸区域对应车辆坐标系原点，符合视觉习惯
 """
 
 import tempfile
@@ -112,6 +113,7 @@ def run(
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
         scale_ratio=0.5,  # 新增：loc窗口显示的图像缩放比例（默认0.5即50%）
+        flip_bev=True,  # 新增：是否上下翻转BEV图像（默认开启，符合视觉习惯）
 ):
     # ====================== 新增：初始化面积数据存储 ====================== #
     area_data = {}  # 格式: {视频路径: {'video_id': ..., 'loc_area': [], 'bev_area': []}}
@@ -136,7 +138,8 @@ def run(
         # 递归查找所有图片和视频文件
         media_files = []
         # 合并图像和视频格式
-        valid_suffixes = [ext.lower() for ext in IMG_FORMATS + VID_FORMATS]
+        #valid_suffixes = [ext.lower() for ext in IMG_FORMATS + VID_FORMATS]
+        valid_suffixes = [ext.lower() for ext in VID_FORMATS]
 
         for root, _, files in os.walk(source):
             for file in files:
@@ -282,6 +285,9 @@ def run(
             # 初始化面积变量，防止未定义
             total_original_area = 0.0
             total_bev_area = 0.0
+            # 初始化轮廓变量，防止后续未定义报错
+            contours = []
+            contoursBevLoc = []
             if view_bev:
                 IhsvMat = cv2.cvtColor(imc, cv2.COLOR_BGR2HSV)
                 Ihsv = IhsvMat[:, :, ::-1]  # transform image to hsv
@@ -353,13 +359,15 @@ def run(
                 cv2.imshow('img', im0)
                 cv2.waitKey(1)  # 1 millisecond
 
-            # ================ 修改：loc窗口按scale_ratio缩放显示 ================ #
+            # ================ 修改：loc窗口按scale_ratio缩放显示（优化面积输出逻辑） ================ #
             if view_loc:
                 if platform.system() == 'Linux' and p not in windows:
                     windows.append(p)
                     cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
                     cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
-                if view_loc and has_class10:
+
+                # 只有检测到class10时，才处理掩码和轮廓提取
+                if has_class10:
                     # Step 1: 反转掩码 - 矩形区域变白(255)，背景变黑(0)
                     mask_inv = 255 - mask
                     # 对障碍物掩码进行膨胀处理
@@ -393,26 +401,30 @@ def run(
                     cv2.drawContours(
                         image=im0,
                         contours=contours,
-                        contourIdx=-1,  # 修复：绘制所有轮廓（原0只绘制第一个，改为-1）
+                        contourIdx=-1,  # 绘制所有轮廓
                         color=(0, 255, 0),  # BGR绿色
                         thickness=1,
                         lineType=cv2.LINE_AA
                     )
 
-                    # ====================== 计算并输出原图绿色轮廓（安全区域）的总面积 ====================== #
-                    if contours:
-                        # 初始化总面积
-                        total_original_area = 0.0
-                        for cnt in contours:
-                            # 计算单个轮廓的面积并累加（cv2.contourArea返回浮点数）
-                            cnt_area = cv2.contourArea(cnt)
-                            if cnt_area > 0:  # 过滤无效的轮廓面积
-                                total_original_area += cnt_area
-                        # 输出面积（保留2位小数，单位：像素²）
-                        LOGGER.info(f"【{p.name}_帧{frame}】原图安全区域（绿色轮廓）总面积：{total_original_area:.2f} 像素²")
-                    else:
-                        LOGGER.info(f"【{p.name}_帧{frame}】原图未检测到有效轮廓，安全区域面积为0")
-                    # =========================================================================================== #
+                # ====================== 计算并输出原图绿色轮廓（安全区域）的总面积（移到条件外） ====================== #
+                if contours:
+                    # 初始化总面积
+                    total_original_area = 0.0
+                    for cnt in contours:
+                        # 计算单个轮廓的面积并累加（cv2.contourArea返回浮点数）
+                        cnt_area = cv2.contourArea(cnt)
+                        if cnt_area > 0:  # 过滤无效的轮廓面积
+                            total_original_area += cnt_area
+                    # 输出面积（保留2位小数，单位：像素²）
+                    LOGGER.info(f"【{p.name}_帧{frame}】原图安全区域（绿色轮廓）总面积：{total_original_area:.2f} 像素²")
+                    # 可选：添加print语句，确保输出能看到（备用）
+                    print(f"【{p.name}_帧{frame}】原图安全区域（绿色轮廓）总面积：{total_original_area:.2f} 像素²")
+                else:
+                    LOGGER.info(f"【{p.name}_帧{frame}】原图未检测到有效轮廓，安全区域面积为0")
+                    # 可选：添加print语句
+                    print(f"【{p.name}_帧{frame}】原图未检测到有效轮廓，安全区域面积为0")
+                # =========================================================================================== #
 
                 # 核心：根据scale_ratio计算新尺寸并缩放图像
                 h, w = im0.shape[:2]
@@ -425,10 +437,6 @@ def run(
 
                 # 处理轮廓并转换为投影后的轮廓（contoursBevLoc）
                 contoursBevLoc = []  # 存储每个轮廓投影后的结果
-                # ====================== 修复：判断contours是否存在（避免未定义错误） ====================== #
-                if 'contours' not in locals():
-                    contours = []  # 初始化空轮廓，防止后续循环报错
-                # ============================================================================== #
                 for cnt in contours:
                     if len(cnt) == 0:
                         continue  # 跳过空轮廓
@@ -448,13 +456,14 @@ def run(
                     cnt_bev_reshaped = cnt_bev_2d.reshape(-1, 1, 2).astype(np.int32)
                     contoursBevLoc.append(cnt_bev_reshaped)
 
-                Bird_annotator.draw_contours(
-                    contours=contoursBevLoc,
-                    color=0,  # BGR黑色
-                    thickness=1,
-                )
+                if view_bev:
+                    Bird_annotator.draw_contours(
+                        contours=contoursBevLoc,
+                        color=0,  # BGR黑色
+                        thickness=1,
+                    )
 
-                # ====================== 计算并输出BEV黑色轮廓（安全区域）的总面积 ====================== #
+                # ====================== 计算并输出BEV黑色轮廓（安全区域）的总面积（移到条件外） ====================== #
                 if contoursBevLoc:
                     # 初始化总面积
                     total_bev_area = 0.0
@@ -463,22 +472,35 @@ def run(
                         cnt_area = cv2.contourArea(cnt)
                         if cnt_area > 0:  # 过滤无效的轮廓面积
                             total_bev_area += cnt_area
-                    # 输出面积（保留2位小数，单位：像素²；若有实际物理尺度，可在此处添加转换逻辑）
+                    # 输出面积（保留2位小数，单位：像素²）
                     LOGGER.info(f"【{p.name}_帧{frame}】BEV安全区域（黑色轮廓）总面积：{total_bev_area:.2f} 像素²")
+                    # 可选：添加print语句，确保输出能看到（备用）
+                    print(f"【{p.name}_帧{frame}】BEV安全区域（黑色轮廓）总面积：{total_bev_area:.2f} 像素²")
                 else:
                     LOGGER.info(f"【{p.name}_帧{frame}】BEV未检测到有效轮廓，安全区域面积为0")
+                    # 可选：添加print语句
+                    print(f"【{p.name}_帧{frame}】BEV未检测到有效轮廓，安全区域面积为0")
                 # =========================================================================================== #
 
-                # 二值化处理BEV图像
-                thresh = 64
-                maxval = 255
-                ret, BirdEdge_VMat = cv2.threshold(BirdImage_VMat, thresh, maxval, cv2.THRESH_BINARY)
+                # 二值化处理BEV图像（仅当view_bev开启时）
+                if view_bev:
+                    thresh = 64
+                    maxval = 255
+                    ret, BirdEdge_VMat = cv2.threshold(BirdImage_VMat, thresh, maxval, cv2.THRESH_BINARY)
 
             # ================ 新增：保存BEV二值图像（修改：移除save_img依赖，只保留视频模式判断） ================ #
             if view_bev:
                 BirdImage_VMat = Bird_annotator.result()
-                cv2.imshow('bev', BirdEdge_VMat)
-                # 保存二值图片到视频所在目录的同名文件夹（仅当处理视频时保存，不再依赖save_img）
+                # ====================== 关键修改：BEV图像上下翻转 ====================== #
+                if flip_bev:
+                    # 对二值化后的BEV图像和标注后的BEV图像都进行上下翻转
+                    BirdEdge_VMat = cv2.flip(BirdEdge_VMat, 0)  # 0表示上下翻转
+                    BirdImage_VMat = cv2.flip(BirdImage_VMat, 0)
+                    BirdEdge_VMat = cv2.flip(BirdEdge_VMat, 1)  # 0表示上下翻转
+                    BirdImage_VMat = cv2.flip(BirdImage_VMat, 1)
+                # ====================================================================== #
+                cv2.imshow('bev', BirdImage_VMat)
+                #保存二值图片到视频所在目录的同名文件夹（仅当处理视频时保存，不再依赖save_img）
                 if dataset.mode == 'video':  # 关键修改：移除save_img，只判断是否是视频模式
                     video_path = Path(p)
                     video_dir = video_path.parent  # 视频所在目录
@@ -489,8 +511,8 @@ def run(
                     # 生成图片文件名（视频名_帧数.png）
                     img_filename = f"{video_name}_{frame}.png"
                     img_save_path = save_bev_dir / img_filename
-                    # 保存二值图片
-                    cv2.imwrite(str(img_save_path), BirdEdge_VMat)
+                    # 保存翻转后的二值图片
+                    cv2.imwrite(str(img_save_path), BirdImage_VMat)
                 cv2.waitKey(1)  # 1 millisecond
 
             # ====================== 新增：收集视频帧的面积数据到字典 ====================== #
@@ -592,6 +614,9 @@ def parse_opt():
     # 新增：scale-ratio参数，用于配置loc窗口的缩放比例
     parser.add_argument('--scale-ratio', type=float, default=0.5,
                         help='loc窗口显示的图像缩放比例（如0.5表示50%，1.0表示100%）')
+    # 新增：flip-bev参数，控制是否上下翻转BEV图像（默认开启）
+    parser.add_argument('--flip-bev', action='store_false', default=True,
+                        help='是否上下翻转BEV图像（默认开启，加--no-flip-bev可关闭）')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
