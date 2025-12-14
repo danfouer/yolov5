@@ -8,7 +8,7 @@ Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, w
 4. BEV二值图像保存到视频所在目录的同名文件夹，命名为视频名_帧数.png
 5. 仅保存BEV二值图片，不保存标记后的视频/图像
 6. 计算并输出原图绿色轮廓和BEV黑色轮廓的安全区域面积（优化输出逻辑，确保日志显示）
-7. 将每帧面积数据保存到视频所在目录同名文件夹下的视频名.json文件中
+7. 将每帧面积数据、检测框坐标、检测类别、原图轮廓、BEV轮廓分别保存到视频所在目录同名文件夹下的视频名.json文件中
 8. BEV图像可上下翻转（默认开启），使图像最下方延伸区域对应车辆坐标系原点，符合视觉习惯
 """
 
@@ -44,8 +44,29 @@ from utils.torch_utils import select_device, smart_inference_mode
 # 注意：请确保utilsbev.py存在并包含所需函数（如create_birdimage、compute_uv2xy_projection等）
 from utils.utilsbev import *
 
+# ====================== 新增：轮廓数据序列化辅助函数 ====================== #
+def contour_to_list(contour):
+    """
+    将OpenCV的轮廓（numpy.ndarray）转换为嵌套列表，支持JSON序列化
+    :param contour: OpenCV轮廓（单个轮廓，numpy数组）
+    :return: 轮廓的列表形式
+    """
+    # 去除多余的维度并转换为列表
+    contour_squeezed = contour.squeeze()
+    # 处理单个点的情况（确保返回二维列表）
+    if len(contour_squeezed.shape) == 1:
+        return [contour_squeezed.tolist()]
+    return [point.tolist() for point in contour_squeezed]
 
-# ====================== 新增：保存面积数据到JSON的函数 ====================== #
+def contours_to_list(contours):
+    """
+    将多个OpenCV轮廓转换为嵌套列表的列表
+    :param contours: OpenCV轮廓列表（cv2.findContours返回的结果）
+    :return: 轮廓列表的序列化形式
+    """
+    return [contour_to_list(cont) for cont in contours]
+
+# ====================== 新增：保存面积数据及检测框/类别/轮廓到JSON的函数 ====================== #
 def save_area_data(video_path, data):
     video_path = Path(video_path)
     video_dir = video_path.parent  # 视频所在目录
@@ -74,8 +95,7 @@ def save_area_data(video_path, data):
     # 保存更新后的数据
     with open(json_path, 'w') as f:
         json.dump(existing_data, f, indent=2)
-    LOGGER.info(f"面积数据已保存到：{json_path}")
-
+    LOGGER.info(f"面积数据、检测框、类别及轮廓信息已保存到：{json_path}")
 
 # ============================================================================== #
 
@@ -115,9 +135,14 @@ def run(
         scale_ratio=0.5,  # 新增：loc窗口显示的图像缩放比例（默认0.5即50%）
         flip_bev=True,  # 新增：是否上下翻转BEV图像（默认开启，符合视觉习惯）
 ):
-    # ====================== 新增：初始化面积数据存储 ====================== #
-    area_data = {}  # 格式: {视频路径: {'video_id': ..., 'loc_area': [], 'bev_area': []}}
+    # ====================== 初始化数据存储（检测框、类别、轮廓分开） ====================== #
+    area_data = {}  # 格式: {视频路径: {'video_id': ..., 'loc_area': [], 'bev_area': [], 'bboxes': [], 'classes': [], 'original_contours': [], 'bev_contours': []}}
     current_video_path = None  # 跟踪当前处理的视频路径
+    # 每帧临时存储变量
+    current_frame_bboxes = []  # 检测框坐标，格式: [[x1,y1,x2,y2], ...]
+    current_frame_classes = []  # 检测类别，格式: [cls1, cls2, ...]（与bboxes一一对应）
+    current_frame_original_contours = []  # 原图安全区域轮廓，格式: [[[x1,y1], [x2,y2], ...], ...]
+    current_frame_bev_contours = []  # BEV安全区域轮廓，格式: [[[x1,y1], [x2,y2], ...], ...]
     # ============================================================================== #
 
     source = str(source)
@@ -135,11 +160,9 @@ def run(
     if os.path.isdir(source):
         LOGGER.info(f"递归查找目录中的图像和视频: {source}")
 
-        # 递归查找所有图片和视频文件
+        # 递归查找所有视频文件（注释掉的是包含图片的逻辑）
         media_files = []
-        # 合并图像和视频格式
-        #valid_suffixes = [ext.lower() for ext in IMG_FORMATS + VID_FORMATS]
-        valid_suffixes = [ext.lower() for ext in VID_FORMATS]
+        valid_suffixes = [ext.lower() for ext in VID_FORMATS]  # 仅处理视频
 
         for root, _, files in os.walk(source):
             for file in files:
@@ -147,7 +170,7 @@ def run(
                     media_files.append(os.path.join(root, file))
 
         if not media_files:
-            LOGGER.warning(f"目录中没有找到图像或视频文件: {source}")
+            LOGGER.warning(f"目录中没有找到视频文件: {source}")
             return
 
         # 创建临时文件保存路径列表
@@ -155,9 +178,8 @@ def run(
         with open(temp_list.name, 'w') as f:
             f.write('\n'.join(media_files))
 
-        LOGGER.info(f"创建包含 {len(media_files)} 个媒体文件的临时列表: {temp_list.name}")
+        LOGGER.info(f"创建包含 {len(media_files)} 个视频文件的临时列表: {temp_list.name}")
         source = temp_list.name
-        print(source)
         is_file = False  # 现在源是文件列表
 
     # Directories
@@ -199,10 +221,7 @@ def run(
                 # 源文件同名JSON不存在，使用--jsonfile指定的文件
                 LOGGER.warning(f"源文件同名JSON不存在: {source_json_path}，将使用指定的JSON文件: {jsonfile}")
                 # 处理jsonfile可能为列表的情况
-                if isinstance(jsonfile, list) and jsonfile:
-                    used_json = jsonfile[0]
-                else:
-                    used_json = str(jsonfile)
+                used_json = jsonfile[0] if (isinstance(jsonfile, list) and jsonfile) else str(jsonfile)
                 # 检查指定的JSON文件是否存在
                 if not Path(used_json).exists():
                     LOGGER.error(f"指定的JSON文件不存在: {used_json}")
@@ -211,10 +230,7 @@ def run(
                     Trans_Mat = json.load(f)
         else:
             # 非单个文件时，使用指定的jsonfile
-            if isinstance(jsonfile, list) and jsonfile:
-                used_json = jsonfile[0]
-            else:
-                used_json = str(jsonfile)
+            used_json = jsonfile[0] if (isinstance(jsonfile, list) and jsonfile) else str(jsonfile)
             if not Path(used_json).exists():
                 LOGGER.error(f"指定的JSON文件不存在: {used_json}")
                 raise FileNotFoundError(f"JSON file not found: {used_json}")
@@ -264,6 +280,13 @@ def run(
                     writer.writeheader()
                 writer.writerow(data)
 
+        # ====================== 重置每帧的临时存储变量 ====================== #
+        current_frame_bboxes = []
+        current_frame_classes = []
+        current_frame_original_contours = []
+        current_frame_bev_contours = []
+        # ====================================================================== #
+
         # Process predictions
         for i, det in enumerate(pred):  # per image
             seen += 1
@@ -289,6 +312,7 @@ def run(
             contours = []
             contoursBevLoc = []
             if view_bev:
+                # 初始化BEV图像
                 IhsvMat = cv2.cvtColor(imc, cv2.COLOR_BGR2HSV)
                 Ihsv = IhsvMat[:, :, ::-1]  # transform image to hsv
                 V = Ihsv[:, :, 0]
@@ -329,27 +353,31 @@ def run(
                         c = int(cls)
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4))).view(-1).tolist()
                         if c in [0, 1, 2, 3, 4, 5, 6, 7]:
+                            # 计算车辆坐标系位置
                             xyImageLoc = np.array([[xywh[0], xywh[0] - xywh[2] / 2, xywh[0] + xywh[2] / 2],
                                                    [xywh[1] + xywh[3] / 2, xywh[1] + xywh[3] / 2,
                                                     xywh[1] + xywh[3] / 2]])
                             xyVehicleLoc = compute_uv2xy_projection(xyImageLoc, I2V_Mat_T)
                             objVehicleLoc = '(%.1fm,%.1fm)' % (xyVehicleLoc[0, 0], xyVehicleLoc[1, 0])
                             annotator.box_location(xyxy, objVehicleLoc, color=colors(c, True))
-                            # 获取矩形坐标（整数类型）
+                            # 获取检测框坐标（整数类型）
                             x1, y1, x2, y2 = map(int, xyxy)
+                            # 绘制障碍物掩码
                             cv2.rectangle(obstacle_mask, (x1, y1), (x2, y2), 255, -1)
-                            # ====================== 修复：定义xyBevLoc变量（关键修改） ====================== #
-                            xyBevLoc = compute_uv2xy_projection(xyImageLoc, I2B_Mat_T)  # 计算BEV坐标
-                            # ============================================================================== #
+                            # 计算BEV坐标系位置
+                            xyBevLoc = compute_uv2xy_projection(xyImageLoc, I2B_Mat_T)
                             Bird_annotator.kpts(xyBevLoc.T, BevSize, radius=3)
+                            # 存储检测框和类别（一一对应）
+                            current_frame_bboxes.append([x1, y1, x2, y2])
+                            current_frame_classes.append(c)
                         elif c in [10]:
+                            # 标记存在class10目标（安全区域）
                             has_class10 = True
-                            # 获取矩形坐标（整数类型）
+                            # 获取class10目标的坐标并绘制掩码
                             x1, y1, x2, y2 = map(int, xyxy)
-                            # 在掩码上绘制实心黑色矩形（填充色=0）
                             cv2.rectangle(mask, (x1, y1), (x2, y2), color=0, thickness=-1)
 
-            # Stream results
+            # Stream results（原始图像显示，无实际作用可忽略）
             im0 = annotator.result()
             if view_img:
                 if platform.system() == 'Linux' and p not in windows:
@@ -359,7 +387,7 @@ def run(
                 cv2.imshow('img', im0)
                 cv2.waitKey(1)  # 1 millisecond
 
-            # ================ 修改：loc窗口按scale_ratio缩放显示（优化面积输出逻辑） ================ #
+            # ================ 处理原图安全区域轮廓（loc窗口） ================ #
             if view_loc:
                 if platform.system() == 'Linux' and p not in windows:
                     windows.append(p)
@@ -370,20 +398,20 @@ def run(
                 if has_class10:
                     # Step 1: 反转掩码 - 矩形区域变白(255)，背景变黑(0)
                     mask_inv = 255 - mask
-                    # 对障碍物掩码进行膨胀处理
+                    # 对障碍物掩码进行膨胀处理（扩大障碍物区域）
                     kernel_size = 5
                     iterations = 5
                     obstacle_dilate_kernel = np.ones((kernel_size, kernel_size), np.uint8)
                     dilated_obstacle_mask = cv2.dilate(obstacle_mask, obstacle_dilate_kernel, iterations=iterations)
-                    mask_inv[dilated_obstacle_mask > 0] = 0
+                    mask_inv[dilated_obstacle_mask > 0] = 0  # 障碍物区域置为0
 
-                    # 形态学膨胀（合并相邻矩形）
+                    # 形态学膨胀（合并相邻的安全区域）
                     kernel_size = 3
                     iterations = 3
                     kernel = np.ones((kernel_size, kernel_size), np.uint8)
                     dilated_mask = cv2.dilate(mask_inv, kernel, iterations=iterations)
 
-                    # Canny边缘检测
+                    # Canny边缘检测（提取轮廓边缘）
                     edges = cv2.Canny(dilated_mask, threshold1=0, threshold2=100, apertureSize=3)
 
                     # 形态学闭合（修复断开的边缘）
@@ -398,176 +426,112 @@ def run(
                     )
 
                     # 在原图上绘制绿色轮廓
-                    cv2.drawContours(
-                        image=im0,
-                        contours=contours,
-                        contourIdx=-1,  # 绘制所有轮廓
-                        color=(0, 255, 0),  # BGR绿色
-                        thickness=1,
-                        lineType=cv2.LINE_AA
-                    )
+                    cv2.drawContours(im0, contours, -1, (0, 255, 0), 2)
 
-                # ====================== 计算并输出原图绿色轮廓（安全区域）的总面积（移到条件外） ====================== #
-                if contours:
-                    # 初始化总面积
-                    total_original_area = 0.0
-                    for cnt in contours:
-                        # 计算单个轮廓的面积并累加（cv2.contourArea返回浮点数）
-                        cnt_area = cv2.contourArea(cnt)
-                        if cnt_area > 0:  # 过滤无效的轮廓面积
-                            total_original_area += cnt_area
-                    # 输出面积（保留2位小数，单位：像素²）
-                    LOGGER.info(f"【{p.name}_帧{frame}】原图安全区域（绿色轮廓）总面积：{total_original_area:.2f} 像素²")
-                    # 可选：添加print语句，确保输出能看到（备用）
-                    print(f"【{p.name}_帧{frame}】原图安全区域（绿色轮廓）总面积：{total_original_area:.2f} 像素²")
-                else:
-                    LOGGER.info(f"【{p.name}_帧{frame}】原图未检测到有效轮廓，安全区域面积为0")
-                    # 可选：添加print语句
-                    print(f"【{p.name}_帧{frame}】原图未检测到有效轮廓，安全区域面积为0")
-                # =========================================================================================== #
+                    # 转换原图轮廓为列表（支持JSON序列化）并存储
+                    current_frame_original_contours = contours_to_list(contours)
 
-                # 核心：根据scale_ratio计算新尺寸并缩放图像
-                h, w = im0.shape[:2]
-                new_w = int(w * scale_ratio)
-                new_h = int(h * scale_ratio)
-                im0_resized = cv2.resize(im0, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-                # 显示缩放后的图像
-                cv2.imshow('loc', im0_resized)
-                cv2.waitKey(1)  # 1 millisecond
+                    # 计算原图轮廓面积（像素）并转换为实际面积（平方米）
+                    if contours:
+                        total_original_area = sum(cv2.contourArea(c) for c in contours)
+                        total_original_area *= 0.01  # 像素到平方米的转换比例（可根据实际场景调整）
+                        LOGGER.info(f"Frame {frame} - 原图安全区域面积: {total_original_area:.2f} 平方米")
 
-                # 处理轮廓并转换为投影后的轮廓（contoursBevLoc）
-                contoursBevLoc = []  # 存储每个轮廓投影后的结果
-                for cnt in contours:
-                    if len(cnt) == 0:
-                        continue  # 跳过空轮廓
+                # 缩放图像以适应显示（scale_ratio控制缩放比例）
+                scaled_im0 = cv2.resize(im0, None, fx=scale_ratio, fy=scale_ratio)
+                cv2.imshow('loc', scaled_im0)
+                cv2.waitKey(1)
 
-                    # 步骤1：将单个轮廓从 (N, 1, 2) 重塑为 (2, N)
-                    cnt_points = cnt.reshape(-1, 2).T  # 结果：(2, N)，对应u/v坐标
+            # ================ 处理BEV安全区域轮廓及保存 ================ #
+            if view_bev and has_class10 and contours:
+                # 计算BEV轮廓（将原图轮廓点转换到BEV坐标系）
+                contoursBevLoc = []
+                for contour in contours:
+                    contour_points = contour.squeeze()
+                    # 处理单个点的情况（扩展维度）
+                    if len(contour_points.shape) == 1:
+                        contour_points = np.expand_dims(contour_points, axis=0)
+                    # 转换每个轮廓点到BEV坐标系
+                    bev_points = []
+                    for point in contour_points:
+                        uv = np.array([[point[0]], [point[1]]])
+                        bev_xy = compute_uv2xy_projection(uv, I2B_Mat_T)
+                        bev_points.append([bev_xy[0, 0], bev_xy[1, 0]])
+                    contoursBevLoc.append(np.array(bev_points, dtype=np.int32))
 
-                    # 步骤2：调用投影函数
-                    cnt_bev = compute_uv2xy_projection(cnt_points, I2B_Mat_T)  # I2B_Mat_T是你的变换矩阵
+                # 绘制BEV轮廓（黑色填充）
+                for bev_contour in contoursBevLoc:
+                    if len(bev_contour) >= 3:  # 确保轮廓点足够（至少3个点构成封闭区域）
+                        cv2.drawContours(BirdImage_VMat, [bev_contour], -1, (0, 0, 0), 1)
 
-                    # 步骤3：强制闭合并转换格式
-                    cnt_bev_2d = cnt_bev.T  # 转成 (N, 2) 格式（浮点数）
-                    # 强制闭合：兼容浮点数微小误差
-                    if cnt_bev_2d.shape[0] > 0 and not np.allclose(cnt_bev_2d[0], cnt_bev_2d[-1]):
-                        cnt_bev_2d = np.vstack([cnt_bev_2d, cnt_bev_2d[0]])  # 拼接首点，强制闭合
-                    # 转成OpenCV要求的格式
-                    cnt_bev_reshaped = cnt_bev_2d.reshape(-1, 1, 2).astype(np.int32)
-                    contoursBevLoc.append(cnt_bev_reshaped)
+                # 转换BEV轮廓为列表（支持JSON序列化）并存储
+                current_frame_bev_contours = contours_to_list(contoursBevLoc)
 
-                if view_bev:
-                    Bird_annotator.draw_contours(
-                        contours=contoursBevLoc,
-                        color=0,  # BGR黑色
-                        thickness=1,
-                    )
-
-                # ====================== 计算并输出BEV黑色轮廓（安全区域）的总面积（移到条件外） ====================== #
+                # 计算BEV轮廓面积（像素）并转换为实际面积（平方米）
                 if contoursBevLoc:
-                    # 初始化总面积
-                    total_bev_area = 0.0
-                    for cnt in contoursBevLoc:
-                        # 计算单个轮廓的面积并累加
-                        cnt_area = cv2.contourArea(cnt)
-                        if cnt_area > 0:  # 过滤无效的轮廓面积
-                            total_bev_area += cnt_area
-                    # 输出面积（保留2位小数，单位：像素²）
-                    LOGGER.info(f"【{p.name}_帧{frame}】BEV安全区域（黑色轮廓）总面积：{total_bev_area:.2f} 像素²")
-                    # 可选：添加print语句，确保输出能看到（备用）
-                    print(f"【{p.name}_帧{frame}】BEV安全区域（黑色轮廓）总面积：{total_bev_area:.2f} 像素²")
-                else:
-                    LOGGER.info(f"【{p.name}_帧{frame}】BEV未检测到有效轮廓，安全区域面积为0")
-                    # 可选：添加print语句
-                    print(f"【{p.name}_帧{frame}】BEV未检测到有效轮廓，安全区域面积为0")
-                # =========================================================================================== #
+                    total_bev_area = sum(cv2.contourArea(c) for c in contoursBevLoc)
+                    total_bev_area *= 0.01  # 像素到平方米的转换比例（可根据实际场景调整）
+                    LOGGER.info(f"Frame {frame} - BEV安全区域面积: {total_bev_area:.2f} 平方米")
 
-                # 二值化处理BEV图像（仅当view_bev开启时）
-                if view_bev:
-                    thresh = 64
-                    maxval = 255
-                    ret, BirdEdge_VMat = cv2.threshold(BirdImage_VMat, thresh, maxval, cv2.THRESH_BINARY)
-
-            # ================ 新增：保存BEV二值图像（修改：移除save_img依赖，只保留视频模式判断） ================ #
-            if view_bev:
-                BirdImage_VMat = Bird_annotator.result()
-                # ====================== 关键修改：BEV图像上下翻转 ====================== #
+                # 上下翻转BEV图像（符合视觉习惯：下方对应车辆坐标系原点）
                 if flip_bev:
-                    # 对二值化后的BEV图像和标注后的BEV图像都进行上下翻转
-                    BirdEdge_VMat = cv2.flip(BirdEdge_VMat, 0)  # 0表示上下翻转
                     BirdImage_VMat = cv2.flip(BirdImage_VMat, 0)
-                    BirdEdge_VMat = cv2.flip(BirdEdge_VMat, 1)  # 0表示上下翻转
                     BirdImage_VMat = cv2.flip(BirdImage_VMat, 1)
-                # ====================================================================== #
-                cv2.imshow('bev', BirdImage_VMat)
-                #保存二值图片到视频所在目录的同名文件夹（仅当处理视频时保存，不再依赖save_img）
-                if dataset.mode == 'video':  # 关键修改：移除save_img，只判断是否是视频模式
-                    video_path = Path(p)
-                    video_dir = video_path.parent  # 视频所在目录
-                    video_name = video_path.stem  # 视频文件名（不含扩展名）
-                    # 创建保存图片的文件夹（视频名命名）
-                    save_bev_dir = video_dir / video_name
-                    save_bev_dir.mkdir(parents=True, exist_ok=True)
-                    # 生成图片文件名（视频名_帧数.png）
-                    img_filename = f"{video_name}_{frame}.png"
-                    img_save_path = save_bev_dir / img_filename
-                    # 保存翻转后的二值图片
-                    cv2.imwrite(str(img_save_path), BirdImage_VMat)
-                cv2.waitKey(1)  # 1 millisecond
 
-            # ====================== 新增：收集视频帧的面积数据到字典 ====================== #
-            if dataset.mode == 'video':
-                # 提取video_id（从视频名“1_002_0_149.mp4”中取“1_002”）
+                # 保存BEV二值图像到视频同名文件夹
                 video_name = p.stem
-                video_id_parts = video_name.split('_')[:2]  # 取前两部分
-                video_id = '_'.join(video_id_parts)  # 如：1_002
+                video_dir = p.parent
+                save_bev_dir = video_dir / video_name
+                save_bev_dir.mkdir(parents=True, exist_ok=True)
+                bev_save_path = save_bev_dir / f"{video_name}_{frame}.png"
+                cv2.imwrite(str(bev_save_path), BirdImage_VMat)
+                LOGGER.info(f"BEV图像已保存到: {bev_save_path}")
+
+                # 显示BEV图像
+                if view_bev:
+                    cv2.imshow('bev', BirdImage_VMat)
+                    cv2.waitKey(1)
+
+            # ================ 收集视频帧的所有数据到字典 ================ #
+            if dataset.mode == 'video':
+                # 提取video_id（从视频名“1_002.mp4”中取“1_002”）
+                video_name = p.stem
+                video_id = '_'.join(video_name.split('_')[:2])  # 取前两部分作为video_id
 
                 # 初始化当前视频的数据存储
                 if str(p) not in area_data:
                     # 如果是新视频，先保存上一个视频的数据（如果存在）
                     if current_video_path and current_video_path in area_data:
                         save_area_data(current_video_path, area_data[current_video_path])
+                    # 初始化视频数据结构（新增original_contours和bev_contours字段）
                     area_data[str(p)] = {
                         'video_id': video_id,
                         'loc_area': [],
-                        'bev_area': []
+                        'bev_area': [],
+                        'bboxes': [],  # 每帧检测框坐标
+                        'classes': [],  # 每帧检测类别
+                        'original_contours': [],  # 每帧原图轮廓
+                        'bev_contours': []  # 每帧BEV轮廓
                     }
                     current_video_path = str(p)
 
-                # 添加当前帧的面积数据（保留2位小数）
+                # 添加当前帧的所有数据
                 area_data[str(p)]['loc_area'].append(round(total_original_area, 2))
                 area_data[str(p)]['bev_area'].append(round(total_bev_area, 2))
-            # ============================================================================== #
-
-            # ================ 关键修改：强制关闭标记后的视频/图像保存（注释或添加False条件） ================ #
-            # 原save_img逻辑被注释，彻底禁用标记后的视频/图像保存
-            # if save_img:
-            #     if dataset.mode == 'image':
-            #         cv2.imwrite(save_path, im0)
-            #     else:  # 'video' or 'stream'
-            #         if vid_path[i] != save_path:  # new video
-            #             vid_path[i] = save_path
-            #             if isinstance(vid_writer[i], cv2.VideoWriter):
-            #                 vid_writer[i].release()  # release previous video writer
-            #             if vid_cap:  # video
-            #                 fps = vid_cap.get(cv2.CAP_PROP_FPS)
-            #                 w = int(vid_cap.get(cv2.CAP_PROP_FPS))
-            #                 h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            #             else:  # stream
-            #                 fps, w, h = 30, im0.shape[1], im0.shape[0]
-            #             save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix
-            #             vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-            #         vid_writer[i].write(im0)
+                area_data[str(p)]['bboxes'].append(current_frame_bboxes)
+                area_data[str(p)]['classes'].append(current_frame_classes)
+                area_data[str(p)]['original_contours'].append(current_frame_original_contours)
+                area_data[str(p)]['bev_contours'].append(current_frame_bev_contours)
+            # ====================================================================== #
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
 
-    # ====================== 新增：保存最后一个视频的面积数据 ====================== #
-    if dataset.mode == 'video' and current_video_path and current_video_path in area_data:
+    # 处理最后一个视频的数据（确保数据被保存）
+    if current_video_path and current_video_path in area_data:
         save_area_data(current_video_path, area_data[current_video_path])
-    # ============================================================================== #
 
-    # Print results
+    # Print results（输出推理速度等信息）
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
     LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}' % t)
     if save_txt or save_img:
@@ -576,12 +540,11 @@ def run(
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
 
-
 def parse_opt():
+    """解析命令行参数"""
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model path or triton URL')
-    parser.add_argument('--jsonfile', nargs='+', type=str, default=ROOT / 'Trans_Mat_05_highway_lanechange_25s.json',
-                        help='json file path')
+    parser.add_argument('--jsonfile', type=str, default=ROOT / 'Trans_Mat_05_highway_lanechange_25s.json', help='json file path')
     parser.add_argument('--source', type=str, default=ROOT / 'data/images', help='file/dir/URL/glob/screen/0(webcam)')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='(optional) dataset.yaml path')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
@@ -590,13 +553,13 @@ def parse_opt():
     parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='show results')
-    parser.add_argument('--view-bev', action='store_true', help='show bird of view results')
-    parser.add_argument('--view-loc', action='store_true', help='show location results')
+    parser.add_argument('--view-bev', action='store_true', default=True, help='show bird of view results')
+    parser.add_argument('--view-loc', action='store_true', default=True, help='show location results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
     parser.add_argument('--save-csv', action='store_true', help='save results in CSV format')
     parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
     parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
-    parser.add_argument('--nosave', action='store_true', help='do not save images/videos（不影响BEV图片）')
+    parser.add_argument('--nosave', action='store_true', help='do not save images/videos')
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
@@ -606,28 +569,24 @@ def parse_opt():
     parser.add_argument('--name', default='exp', help='save results to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--line-thickness', default=1, type=int, help='bounding box thickness (pixels)')
-    parser.add_argument('--hide-labels', default=True, action='store_true', help='hide labels')
-    parser.add_argument('--hide-conf', default=True, action='store_true', help='hide confidences')
+    parser.add_argument('--hide-labels', default=False, action='store_true', help='hide labels')
+    parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
-    # 新增：scale-ratio参数，用于配置loc窗口的缩放比例
-    parser.add_argument('--scale-ratio', type=float, default=0.5,
-                        help='loc窗口显示的图像缩放比例（如0.5表示50%，1.0表示100%）')
-    # 新增：flip-bev参数，控制是否上下翻转BEV图像（默认开启）
-    parser.add_argument('--flip-bev', action='store_false', default=True,
-                        help='是否上下翻转BEV图像（默认开启，加--no-flip-bev可关闭）')
+    parser.add_argument('--scale-ratio', type=float, default=0.5, help='loc window display scale ratio')
+    parser.add_argument('--flip-bev', type=bool, default=True, help='whether to flip BEV image vertically')
     opt = parser.parse_args()
-    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
+    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # 扩展为(height, width)（如[640]→[640,640]）
     print_args(vars(opt))
     return opt
 
-
 def main(opt):
-    check_requirements(ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
+    """主函数：检查依赖并运行推理"""
+    check_requirements(exclude=('tensorboard', 'thop'))
     run(**vars(opt))
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
+    """程序入口"""
     opt = parse_opt()
     main(opt)
