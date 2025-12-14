@@ -71,9 +71,9 @@ def run(
         iou_thres=0.45,  # NMS IOU threshold
         max_det=1000,  # maximum detections per image
         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
-        view_img=True,  # show results
-        view_bev=False,  # show brid of view results
-        view_loc=False,  # show location results
+        view_img=False,  # show results
+        view_bev=True,  # show brid of view results
+        view_loc=True,  # show location results
         save_txt=False,  # save results to *.txt
         save_csv=False,  # save results in CSV format
         save_conf=False,  # save confidences in --save-txt labels
@@ -158,40 +158,42 @@ def run(
     vid_path, vid_writer = [None] * bs, [None] * bs
  #############################################################################
     if view_bev:
+        # 构建源文件对应的JSON路径（使用Path处理更规范，避免重复后缀问题）
+        source_path = Path(source)
+        source_json_path = source_path.with_suffix('.json')  # 替代source+'.json'，处理如source已带后缀的情况
+
         if is_file:
-            with open(source+'.json', 'r') as f:
-                Trans_Mat = json.load(f)
+            # 优先检查源文件同名JSON是否存在
+            if source_json_path.exists():
+                LOGGER.info(f"加载源文件同名JSON: {source_json_path}")
+                with open(source_json_path, 'r') as f:
+                    Trans_Mat = json.load(f)
+            else:
+                # 源文件同名JSON不存在，使用--jsonfile指定的文件
+                LOGGER.warning(f"源文件同名JSON不存在: {source_json_path}，将使用指定的JSON文件: {jsonfile}")
+                # 处理jsonfile可能为列表的情况（保持与原有逻辑兼容）
+                if isinstance(jsonfile, list) and jsonfile:
+                    used_json = jsonfile[0]
+                else:
+                    used_json = str(jsonfile)
+                # 检查指定的JSON文件是否存在
+                if not Path(used_json).exists():
+                    LOGGER.error(f"指定的JSON文件不存在: {used_json}")
+                    raise FileNotFoundError(f"JSON file not found: {used_json}")
+                with open(used_json, 'r') as f:
+                    Trans_Mat = json.load(f)
         else:
-            #jsonfile = str(jsonfile)
-            #json_path = Path(jsonfile)
+            # 非单个文件时，使用指定的jsonfile（保持原有逻辑并增强健壮性）
             if isinstance(jsonfile, list) and jsonfile:
-                jsonfile = jsonfile[0]  # 取列表中的第一个元素
-            jsonfile = str(jsonfile)  # 确保是字符串类型
-            print(jsonfile)
-            with open(jsonfile, 'r') as f:
+                used_json = jsonfile[0]
+            else:
+                used_json = str(jsonfile)
+            if not Path(used_json).exists():
+                LOGGER.error(f"指定的JSON文件不存在: {used_json}")
+                raise FileNotFoundError(f"JSON file not found: {used_json}")
+            LOGGER.info(f"使用指定的JSON文件: {used_json}")
+            with open(used_json, 'r') as f:
                 Trans_Mat = json.load(f)
-    # if view_bev:
-    #     json_path = None
-    #
-    #     # 如果是单个文件，尝试使用与图像同名的JSON文件
-    #     if is_file:
-    #         json_path = Path(source).with_suffix('.json')
-    #         if not json_path.exists():
-    #             LOGGER.warning(f"Image-specific JSON not found: {json_path}")
-    #             json_path = None
-    #
-    #     # 如果未找到图像特定JSON，使用指定的jsonfile
-    #     if not json_path:
-    #         json_path = Path(jsonfile)
-    #         LOGGER.info(f"Using specified JSON file: {json_path}")
-    #
-    #     # 检查并加载JSON文件
-    #     if json_path.exists():
-    #         with open(json_path, 'r') as f:
-    #             Trans_Mat = json.load(f)
-    #     else:
-    #         LOGGER.error(f"JSON file not found: {json_path}")
-    #         continue
         # 读取前视图I-车辆坐标系V-鸟瞰图相互转换矩阵
         # V2I_Mat = np.array(Trans_Mat['V2I_Mat'])
         # I2V_Mat = np.array(Trans_Mat['I2V_Mat'])
@@ -447,7 +449,7 @@ def run(
                 thresh = 64
                 maxval = 255
                 # 最常用的二值化类型：cv2.THRESH_BINARY，去掉目标，只剩道路
-                #ret, BirdEdge_VMat = cv2.threshold(BirdImage_VMat, thresh, maxval, cv2.THRESH_BINARY)
+                ret, BirdEdge_VMat = cv2.threshold(BirdImage_VMat, thresh, maxval, cv2.THRESH_BINARY)
 
                 # # # 假设BirdEdge_VMat是单通道二值图像（0=黑，255=白）
                 # # # 步骤1：查找轮廓（保留你的原逻辑）
@@ -475,7 +477,22 @@ def run(
 
 
                 #ret, BirdImage_VMat = cv2.threshold(BirdImage_VMat, 0, 255, cv2.THRESH_BINARY)
-                cv2.imshow('bev', BirdImage_VMat)
+                cv2.imshow('bev', BirdEdge_VMat)
+                # 获取视频路径和名称
+                # video_path = Path(p)
+                # video_dir = video_path.parent  # 视频所在目录
+                # video_name = video_path.stem  # 视频文件名（不含扩展名）
+                #
+                # # 创建保存图片的文件夹（视频名命名）
+                # save_bev_dir = video_dir / video_name
+                # save_bev_dir.mkdir(parents=True, exist_ok=True)
+                #
+                # # 生成图片文件名（视频名_帧数.png）
+                # img_filename = f"{video_name}_{frame}.png"
+                # img_save_path = save_bev_dir / img_filename
+                #
+                # # 保存二值图片
+                # cv2.imwrite(str(img_save_path), BirdEdge_VMat)
                 cv2.waitKey(1)  # 1 millisecond
 
             # Save results (image with detections)
