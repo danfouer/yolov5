@@ -105,29 +105,30 @@ def run(
         print(source)
 
     # ================ 新增代码开始 ================ #
-    # 如果源是目录，递归查找所有图像文件
+    # 如果源是目录，递归查找所有图像和视频文件
     if os.path.isdir(source):
-        LOGGER.info(f"递归查找目录中的图像: {source}")
+        LOGGER.info(f"递归查找目录中的图像和视频: {source}")
 
-        # 递归查找所有图片文件
-        img_files = []
-        valid_suffixes = [ext.lower() for ext in IMG_FORMATS]
+        # 递归查找所有图片和视频文件
+        media_files = []
+        # 合并图像和视频格式
+        valid_suffixes = [ext.lower() for ext in IMG_FORMATS + VID_FORMATS]
 
         for root, _, files in os.walk(source):
             for file in files:
                 if Path(file).suffix[1:].lower() in valid_suffixes:
-                    img_files.append(os.path.join(root, file))
+                    media_files.append(os.path.join(root, file))
 
-        if not img_files:
-            LOGGER.warning(f"目录中没有找到图像文件: {source}")
+        if not media_files:
+            LOGGER.warning(f"目录中没有找到图像或视频文件: {source}")
             return
 
         # 创建临时文件保存路径列表
         temp_list = tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False)
         with open(temp_list.name, 'w') as f:
-            f.write('\n'.join(img_files))
+            f.write('\n'.join(media_files))
 
-        LOGGER.info(f"创建包含 {len(img_files)} 个图像的临时列表: {temp_list.name}")
+        LOGGER.info(f"创建包含 {len(media_files)} 个媒体文件的临时列表: {temp_list.name}")
         source = temp_list.name
         print(source)
         is_file = False  # 现在源是文件列表
@@ -349,9 +350,6 @@ def run(
                             # 在掩码上绘制实心黑色矩形（填充色=0）
                             cv2.rectangle(mask, (x1, y1), (x2, y2), color=0, thickness=-1)
 
-
-
-
             # Stream results
             im0 = annotator.result()
             if view_img:
@@ -437,8 +435,6 @@ def run(
                     # 步骤4：添加到结果列表
                     contoursBevLoc.append(cnt_bev_reshaped)
 
-
-
                 Bird_annotator.draw_contours(
                     contours=contoursBevLoc,
                     color=0,  # BGR黑色
@@ -477,7 +473,7 @@ def run(
 
 
                 #ret, BirdImage_VMat = cv2.threshold(BirdImage_VMat, 0, 255, cv2.THRESH_BINARY)
-                cv2.imshow('bev', BirdEdge_VMat)
+                cv2.imshow('bev', BirdImage_VMat)
                 # 获取视频路径和名称
                 # video_path = Path(p)
                 # video_dir = video_path.parent  # 视频所在目录
