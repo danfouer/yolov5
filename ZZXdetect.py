@@ -10,6 +10,7 @@ Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, w
 6. 计算并输出原图绿色轮廓和BEV黑色轮廓的安全区域面积（优化输出逻辑，确保日志显示）
 7. 将每帧面积数据、检测框坐标、检测类别、原图轮廓、BEV轮廓分别保存到视频所在目录同名文件夹下的视频名.json文件中
 8. BEV图像可上下翻转（默认开启），使图像最下方延伸区域对应车辆坐标系原点，符合视觉习惯
+9. 记录0-7类检测框中侵入上一帧原图轮廓区域的box的类别和边界框到JSON文件
 """
 
 import tempfile
@@ -25,6 +26,7 @@ import numpy as np
 import torch
 import json  # 确保导入json库
 import warnings
+import cv2  # 确保导入cv2
 
 warnings.filterwarnings('ignore')
 
@@ -44,6 +46,7 @@ from utils.torch_utils import select_device, smart_inference_mode
 # 注意：请确保utilsbev.py存在并包含所需函数（如create_birdimage、compute_uv2xy_projection等）
 from utils.utilsbev import *
 
+
 # ====================== 新增：轮廓数据序列化辅助函数 ====================== #
 def contour_to_list(contour):
     """
@@ -58,6 +61,7 @@ def contour_to_list(contour):
         return [contour_squeezed.tolist()]
     return [point.tolist() for point in contour_squeezed]
 
+
 def contours_to_list(contours):
     """
     将多个OpenCV轮廓转换为嵌套列表的列表
@@ -65,6 +69,31 @@ def contours_to_list(contours):
     :return: 轮廓列表的序列化形式
     """
     return [contour_to_list(cont) for cont in contours]
+
+
+# ====================== 新增：判断检测框是否侵入轮廓的辅助函数 ====================== #
+def is_box_intrude_contours(bbox, contours):
+    """
+    判断检测框是否侵入轮廓区域（检测框任意顶点在轮廓内/边界即判定为侵入）
+    :param bbox: 检测框坐标，格式为[x1, y1, x2, y2]（整数）
+    :param contours: OpenCV轮廓列表（numpy.ndarray类型，未序列化的原始轮廓）
+    :return: bool，True表示侵入，False表示未侵入
+    """
+    if not contours:  # 轮廓为空时，无侵入
+        return False
+
+    x1, y1, x2, y2 = bbox
+    # 检测框的四个顶点
+    points = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+
+    for contour in contours:
+        for point in points:
+            # cv2.pointPolygonTest：返回值>0表示点在轮廓内，=0表示在边界，<0表示在外部
+            dist = cv2.pointPolygonTest(contour, point, measureDist=False)
+            if dist >= 0:  # 点在轮廓内或边界，判定为侵入
+                return True
+    return False
+
 
 # ====================== 新增：保存面积数据及检测框/类别/轮廓到JSON的函数 ====================== #
 def save_area_data(video_path, data):
@@ -96,6 +125,7 @@ def save_area_data(video_path, data):
     with open(json_path, 'w') as f:
         json.dump(existing_data, f, indent=2)
     LOGGER.info(f"面积数据、检测框、类别及轮廓信息已保存到：{json_path}")
+
 
 # ============================================================================== #
 
@@ -136,13 +166,19 @@ def run(
         flip_bev=True,  # 新增：是否上下翻转BEV图像（默认开启，符合视觉习惯）
 ):
     # ====================== 初始化数据存储（检测框、类别、轮廓分开） ====================== #
-    area_data = {}  # 格式: {视频路径: {'video_id': ..., 'loc_area': [], 'bev_area': [], 'bboxes': [], 'classes': [], 'original_contours': [], 'bev_contours': []}}
+    area_data = {}  # 格式: {视频路径: {'video_id': ..., 'loc_area': [], 'bev_area': [], 'bboxes': [], 'classes': [], 'original_contours': [], 'bev_contours': [], 'intruded_bboxes': [], 'intruded_classes': []}}
     current_video_path = None  # 跟踪当前处理的视频路径
     # 每帧临时存储变量
     current_frame_bboxes = []  # 检测框坐标，格式: [[x1,y1,x2,y2], ...]
     current_frame_classes = []  # 检测类别，格式: [cls1, cls2, ...]（与bboxes一一对应）
-    current_frame_original_contours = []  # 原图安全区域轮廓，格式: [[[x1,y1], [x2,y2], ...], ...]
-    current_frame_bev_contours = []  # BEV安全区域轮廓，格式: [[[x1,y1], [x2,y2], ...], ...]
+    current_frame_original_contours = []  # 原图安全区域轮廓（序列化后），格式: [[[x1,y1], [x2,y2], ...], ...]
+    current_frame_bev_contours = []  # BEV安全区域轮廓（序列化后），格式: [[[x1,y1], [x2,y2], ...], ...]
+    # 新增：存储当前帧侵入上一帧轮廓的box和类别
+    current_frame_intruded_bboxes = []  # 侵入的box坐标，格式: [[x1,y1,x2,y2], ...]
+    current_frame_intruded_classes = []  # 侵入的box类别，格式: [cls1, cls2, ...]
+    # 新增：保存上一帧的原图原始轮廓（未序列化的numpy数组，用于侵入判断）
+    previous_original_contours = []  # 初始化为空，第一帧无ufer上一帧轮廓
+
     # ============================================================================== #
 
     source = str(source)
@@ -285,6 +321,9 @@ def run(
         current_frame_classes = []
         current_frame_original_contours = []
         current_frame_bev_contours = []
+        # 新增：重置当前帧侵入的box和类别
+        current_frame_intruded_bboxes = []
+        current_frame_intruded_classes = []
         # ====================================================================== #
 
         # Process predictions
@@ -308,8 +347,8 @@ def run(
             # 初始化面积变量，防止未定义
             total_original_area = 0.0
             total_bev_area = 0.0
-            # 初始化轮廓变量，防止后续未定义报错
-            contours = []
+            # 初始化轮廓变量，防止后续未定义报错（原始轮廓，未序列化）
+            current_frame_original_contours_raw = []  # 新增：存储当前帧原始轮廓，用于后续更新上一帧轮廓
             contoursBevLoc = []
             if view_bev:
                 # 初始化BEV图像
@@ -362,14 +401,22 @@ def run(
                             annotator.box_location(xyxy, objVehicleLoc, color=colors(c, True))
                             # 获取检测框坐标（整数类型）
                             x1, y1, x2, y2 = map(int, xyxy)
+                            bbox = [x1, y1, x2, y2]
                             # 绘制障碍物掩码
                             cv2.rectangle(obstacle_mask, (x1, y1), (x2, y2), 255, -1)
                             # 计算BEV坐标系位置
                             xyBevLoc = compute_uv2xy_projection(xyImageLoc, I2B_Mat_T)
                             Bird_annotator.kpts(xyBevLoc.T, BevSize, radius=3)
                             # 存储检测框和类别（一一对应）
-                            current_frame_bboxes.append([x1, y1, x2, y2])
+                            current_frame_bboxes.append(bbox)
                             current_frame_classes.append(c)
+
+                            # 新增：判断当前box是否侵入上一帧的原图轮廓
+                            if is_box_intrude_contours(bbox, previous_original_contours):
+                                current_frame_intruded_bboxes.append(bbox)
+                                current_frame_intruded_classes.append(c)
+                                LOGGER.info(f"Frame {frame} - 检测框{bbox}（类别{c}）侵入上一帧轮廓区域")
+
                         elif c in [10]:
                             # 标记存在class10目标（安全区域）
                             has_class10 = True
@@ -424,6 +471,8 @@ def run(
                         mode=cv2.RETR_EXTERNAL,
                         method=cv2.CHAIN_APPROX_SIMPLE
                     )
+                    # 保存当前帧的原始轮廓（用于更新上一帧轮廓和侵入判断）
+                    current_frame_original_contours_raw = contours
 
                     # 在原图上绘制绿色轮廓
                     cv2.drawContours(im0, contours, -1, (0, 255, 0), 2)
@@ -436,6 +485,10 @@ def run(
                         total_original_area = sum(cv2.contourArea(c) for c in contours)
                         total_original_area *= 0.01  # 像素到平方米的转换比例（可根据实际场景调整）
                         LOGGER.info(f"Frame {frame} - 原图安全区域面积: {total_original_area:.2f} 平方米")
+                else:
+                    # 没有检测到class10时，轮廓为空
+                    current_frame_original_contours_raw = []
+                    current_frame_original_contours = []
 
                 # 缩放图像以适应显示（scale_ratio控制缩放比例）
                 scaled_im0 = cv2.resize(im0, None, fx=scale_ratio, fy=scale_ratio)
@@ -443,10 +496,10 @@ def run(
                 cv2.waitKey(1)
 
             # ================ 处理BEV安全区域轮廓及保存 ================ #
-            if view_bev and has_class10 and contours:
+            if view_bev and has_class10 and current_frame_original_contours_raw:
                 # 计算BEV轮廓（将原图轮廓点转换到BEV坐标系）
                 contoursBevLoc = []
-                for contour in contours:
+                for contour in current_frame_original_contours_raw:
                     contour_points = contour.squeeze()
                     # 处理单个点的情况（扩展维度）
                     if len(contour_points.shape) == 1:
@@ -478,19 +531,22 @@ def run(
                     BirdImage_VMat = cv2.flip(BirdImage_VMat, 0)
                     BirdImage_VMat = cv2.flip(BirdImage_VMat, 1)
 
-                # 保存BEV二值图像到视频同名文件夹
-                video_name = p.stem
-                video_dir = p.parent
-                save_bev_dir = video_dir / video_name
-                save_bev_dir.mkdir(parents=True, exist_ok=True)
-                bev_save_path = save_bev_dir / f"{video_name}_{frame}.png"
-                cv2.imwrite(str(bev_save_path), BirdImage_VMat)
-                LOGGER.info(f"BEV图像已保存到: {bev_save_path}")
+                # # 保存BEV二值图像到视频同名文件夹
+                # video_name = p.stem
+                # video_dir = p.parent
+                # save_bev_dir = video_dir / video_name
+                # save_bev_dir.mkdir(parents=True, exist_ok=True)
+                # bev_save_path = save_bev_dir / f"{video_name}_{frame}.png"
+                # cv2.imwrite(str(bev_save_path), BirdImage_VMat)
+                # LOGGER.info(f"BEV图像已保存到: {bev_save_path}")
 
                 # 显示BEV图像
                 if view_bev:
                     cv2.imshow('bev', BirdImage_VMat)
                     cv2.waitKey(1)
+            else:
+                # 无BEV轮廓时，存储空列表
+                current_frame_bev_contours = []
 
             # ================ 收集视频帧的所有数据到字典 ================ #
             if dataset.mode == 'video':
@@ -503,7 +559,7 @@ def run(
                     # 如果是新视频，先保存上一个视频的数据（如果存在）
                     if current_video_path and current_video_path in area_data:
                         save_area_data(current_video_path, area_data[current_video_path])
-                    # 初始化视频数据结构（新增original_contours和bev_contours字段）
+                    # 初始化视频数据结构（新增intruded_bboxes和intruded_classes字段）
                     area_data[str(p)] = {
                         'video_id': video_id,
                         'loc_area': [],
@@ -511,7 +567,9 @@ def run(
                         'bboxes': [],  # 每帧检测框坐标
                         'classes': [],  # 每帧检测类别
                         'original_contours': [],  # 每帧原图轮廓
-                        'bev_contours': []  # 每帧BEV轮廓
+                        'bev_contours': [],  # 每帧BEV轮廓
+                        'intruded_bboxes': [],  # 每帧侵入上一帧轮廓的box坐标
+                        'intruded_classes': []  # 每帧侵入上一帧轮廓的box类别
                     }
                     current_video_path = str(p)
 
@@ -522,6 +580,14 @@ def run(
                 area_data[str(p)]['classes'].append(current_frame_classes)
                 area_data[str(p)]['original_contours'].append(current_frame_original_contours)
                 area_data[str(p)]['bev_contours'].append(current_frame_bev_contours)
+                # 新增：添加侵入的box和类别数据
+                area_data[str(p)]['intruded_bboxes'].append(current_frame_intruded_bboxes)
+                area_data[str(p)]['intruded_classes'].append(current_frame_intruded_classes)
+
+            # ================ 新增：更新上一帧的原图轮廓 ================ #
+            # 仅当当前帧有原始轮廓时，才更新上一帧轮廓（保证下一帧有正确的轮廓可判断）
+            if current_frame_original_contours_raw:
+                previous_original_contours = current_frame_original_contours_raw
             # ====================================================================== #
 
         # Print time (inference-only)
@@ -540,11 +606,13 @@ def run(
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
 
+
 def parse_opt():
     """解析命令行参数"""
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model path or triton URL')
-    parser.add_argument('--jsonfile', type=str, default=ROOT / 'Trans_Mat_05_highway_lanechange_25s.json', help='json file path')
+    parser.add_argument('--jsonfile', type=str, default=ROOT / 'Trans_Mat_05_highway_lanechange_25s.json',
+                        help='json file path')
     parser.add_argument('--source', type=str, default=ROOT / 'data/images', help='file/dir/URL/glob/screen/0(webcam)')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='(optional) dataset.yaml path')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
@@ -581,10 +649,12 @@ def parse_opt():
     print_args(vars(opt))
     return opt
 
+
 def main(opt):
     """主函数：检查依赖并运行推理"""
     check_requirements(exclude=('tensorboard', 'thop'))
     run(**vars(opt))
+
 
 if __name__ == "__main__":
     """程序入口"""
