@@ -1,4 +1,3 @@
-# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
 """
 Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, webcam, streams, etc.
 修改后支持：
@@ -11,6 +10,7 @@ Run YOLOv5 detection inference on images, videos, directories, globs, YouTube, w
 7. 将每帧面积数据、检测框坐标、检测类别、原图轮廓、BEV轮廓分别保存到视频所在目录同名文件夹下的视频名.json文件中
 8. BEV图像可上下翻转（默认开启），使图像最下方延伸区域对应车辆坐标系原点，符合视觉习惯
 9. 记录0-7类检测框中侵入上一帧原图轮廓区域的box的类别和边界框到JSON文件
+10. 修复：同一个video_id重复写入JSON的问题
 """
 
 import tempfile
@@ -21,6 +21,7 @@ import csv
 import os
 import platform
 import sys
+import hashlib
 from pathlib import Path
 import numpy as np
 import torch
@@ -95,7 +96,22 @@ def is_box_intrude_contours(bbox, contours):
     return False
 
 
-# ====================== 新增：保存面积数据及检测框/类别/轮廓到JSON的函数 ====================== #
+# ====================== 新增：生成唯一video_id的函数 ====================== #
+def get_unique_video_id(video_path):
+    """
+    生成唯一的video_id，避免重复
+    :param video_path: 视频文件路径（Path对象）
+    :return: 唯一的video_id字符串
+    """
+    # 方案1：使用视频完整文件名（不含扩展名）作为video_id（推荐，可读性高）
+    video_id = video_path.stem
+    # 方案2：若需绝对唯一，可使用路径哈希（注释掉，按需启用）
+    # video_path_str = str(video_path.absolute())
+    # video_id = hashlib.md5(video_path_str.encode()).hexdigest()[:10]
+    return video_id
+
+
+# ====================== 修复：保存面积数据及检测框/类别/轮廓到JSON的函数 ====================== #
 def save_area_data(video_path, data):
     video_path = Path(video_path)
     video_dir = video_path.parent  # 视频所在目录
@@ -117,14 +133,26 @@ def save_area_data(video_path, data):
             existing_data = {}
             LOGGER.warning(f"JSON文件{json_path}损坏，将重新创建")
 
-    # 添加当前视频数据（video_1, video_2...）
-    video_key = f"video_{len(existing_data) + 1}"
+    # 核心修复：检查是否已有相同video_id的条目，有则更新，无则新增
+    target_video_id = data['video_id']
+    video_key = None
+    # 遍历现有数据，查找相同video_id的key
+    for key, value in existing_data.items():
+        if value.get('video_id') == target_video_id:
+            video_key = key
+            break
+
+    # 未找到则生成新key，找到则复用原有key
+    if video_key is None:
+        video_key = f"video_{len(existing_data) + 1}"
+
+    # 更新/新增数据
     existing_data[video_key] = data
 
     # 保存更新后的数据
     with open(json_path, 'w') as f:
         json.dump(existing_data, f, indent=2)
-    LOGGER.info(f"面积数据、检测框、类别及轮廓信息已保存到：{json_path}")
+    LOGGER.info(f"面积数据、检测框、类别及轮廓信息已保存到：{json_path} (video_id: {target_video_id}, key: {video_key})")
 
 
 # ============================================================================== #
@@ -168,6 +196,7 @@ def run(
     # ====================== 初始化数据存储（检测框、类别、轮廓分开） ====================== #
     area_data = {}  # 格式: {视频路径: {'video_id': ..., 'loc_area': [], 'bev_area': [], 'bboxes': [], 'classes': [], 'original_contours': [], 'bev_contours': [], 'intruded_bboxes': [], 'intruded_classes': []}}
     current_video_path = None  # 跟踪当前处理的视频路径
+    temp_file_path = None  # 跟踪临时文件路径，用于后续清理
     # 每帧临时存储变量
     current_frame_bboxes = []  # 检测框坐标，格式: [[x1,y1,x2,y2], ...]
     current_frame_classes = []  # 检测类别，格式: [cls1, cls2, ...]（与bboxes一一对应）
@@ -177,7 +206,7 @@ def run(
     current_frame_intruded_bboxes = []  # 侵入的box坐标，格式: [[x1,y1,x2,y2], ...]
     current_frame_intruded_classes = []  # 侵入的box类别，格式: [cls1, cls2, ...]
     # 新增：保存上一帧的原图原始轮廓（未序列化的numpy数组，用于侵入判断）
-    previous_original_contours = []  # 初始化为空，第一帧无ufer上一帧轮廓
+    previous_original_contours = []  # 初始化为空，第一帧无上一帧轮廓
 
     # ============================================================================== #
 
@@ -192,11 +221,11 @@ def run(
         source = check_file(source)  # download
         print(source)
 
-    # ================ 新增：批量处理目录下的所有视频/图像文件 ================ #
+    # ================ 新增：批量处理目录下的所有视频/图像文件（修复临时文件逻辑） ================ #
     if os.path.isdir(source):
         LOGGER.info(f"递归查找目录中的图像和视频: {source}")
 
-        # 递归查找所有视频文件（注释掉的是包含图片的逻辑）
+        # 递归查找所有视频文件
         media_files = []
         valid_suffixes = [ext.lower() for ext in VID_FORMATS]  # 仅处理视频
 
@@ -209,8 +238,13 @@ def run(
             LOGGER.warning(f"目录中没有找到视频文件: {source}")
             return
 
+        # 去重：避免同一视频被多次添加
+        media_files = list(set(media_files))
+        LOGGER.info(f"去重后找到 {len(media_files)} 个视频文件")
+
         # 创建临时文件保存路径列表
         temp_list = tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False)
+        temp_file_path = temp_list.name  # 记录临时文件路径，用于后续清理
         with open(temp_list.name, 'w') as f:
             f.write('\n'.join(media_files))
 
